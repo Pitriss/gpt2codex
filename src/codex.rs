@@ -131,6 +131,9 @@ fn read_frame(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
 
 impl CodexClient {
     pub fn connect() -> Result<Self> {
+        crate::project_supervisor::manual_start_gate().map_err(|_| {
+            CodexError::Protocol("session_unverified: project supervisor runtime_disabled; no app-server fallback")
+        })?;
         let mut cmd = Command::new("codex");
         cmd.arg("app-server");
         Self::connect_command(cmd, REQUEST_TIMEOUT)

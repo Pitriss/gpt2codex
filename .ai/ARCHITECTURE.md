@@ -1,5 +1,19 @@
 # Architecture (target design; local P0-H read-only stdio gateway in progress)
 
+## Ordinary-question attention P0-M (2026-11-02)
+
+The shared P0-A Qt reducer now consumes a read-only MarkerAttentionSource for
+explicitly instrumented new runs. A separate private runtime binding ties project,
+actual mux/full server generation and Codex process generation/ancestry to a
+fresh run nonce. The opt-in foreground wrapper verifies the registered slot and
+execs Codex; existing JSON records and default start/attach paths are preserved.
+Rust mark/clear use descriptor-safe private files, canonical bounded metadata,
+atomic creation and a per-run lock; clear requires the precise question nonce.
+Qt watches the directory tree and revalidates provenance without subprocesses.
+Only yellow/unknown are emitted; no terminal text or conversation is parsed.
+No global hooks, implicit approvals, auto-recovery or real Codex smoke is included.
+See [GUI](../gui/README.md#p0-m-ordinary-question-markers-2026-11-02).
+
 ## Approved local tmux lifecycle and archive (2026-10-27)
 
 New tmux starts may opt into `--remain-on-exit`. A private startup config is

@@ -14,6 +14,15 @@
 #include <QFontMetricsF>
 #include <QFontInfo>
 #include <memory>
+#include <cerrno>
+#include <cstdlib>
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+#if __has_include(<qtermwidget6/qtermwidget_interface.h>)
+#include <qtermwidget6/qtermwidget_interface.h>
+#define G2C_MOUSE_QTERM_INTERFACE
+#endif
 #ifdef G2C_TEST_KONSOLE
 #include <KSharedConfig>
 #endif
@@ -26,6 +35,163 @@ class BackendTests final : public QObject {
     std::unique_ptr<QPluginLoader> loader_;
     const QByteArray config_ = "[Desktop Entry]\nDefaultProfile=Fixture.profile\n[TabBar]\nSearchTabsButton=1\nCloseTabButton=2\n";
     QFont diagnosticFont_;
+    QByteArray mouseBytes_;
+    static QByteArray terminalInput(int fd) {
+        QByteArray result;
+        char bytes[1024];
+        for (;;) {
+            const auto n = ::read(fd, bytes, sizeof bytes);
+            if (n > 0) {
+                result.append(bytes, int(n));
+                if (result.size() > 4096) { return "INPUT_BOUND_EXCEEDED"; }
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return result;
+            } else { return "PTY_READ_FAILED"; }
+        }
+    }
+    void checkMouseModes(const QString &name, int mode) {
+        auto *backend = load(name);
+        QVERIFY2(backend, qPrintable(loader_->errorString()));
+        // A second brand-new, unstarted view models replacement on reconnect.
+        // No backend->start(), process, session registry or user PTY is used.
+        for (int generation = 0; generation < 2; ++generation) {
+            std::unique_ptr<QWidget> view(backend->create(nullptr, "/bin/true", {}, {}));
+            QVERIFY(view);
+            struct OwnedFd {
+                int fd = -1;
+                QByteArray slaveName;
+                ~OwnedFd() {
+                    // A library may close an adopted master. Do not close a
+                    // reused descriptor belonging to another Qt object.
+                    char path[256];
+                    if (fd >= 0 && (slaveName.isEmpty()
+                        || (::ptsname_r(fd, path, sizeof path) == 0 && slaveName == path))) { ::close(fd); }
+                }
+            } master, slave;
+            QObject *session = nullptr;
+            if (name == "konsole") {
+                master.fd = ::posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+                QVERIFY(master.fd >= 0);
+                QVERIFY(::grantpt(master.fd) == 0 && ::unlockpt(master.fd) == 0);
+                char path[256];
+                QVERIFY(::ptsname_r(master.fd, path, sizeof path) == 0);
+                master.slaveName = path;
+                slave.fd = ::open(path, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+                QVERIFY(slave.fd >= 0);
+                termios raw{};
+                QVERIFY(::tcgetattr(slave.fd, &raw) == 0);
+                ::cfmakeraw(&raw);
+                QVERIFY(::tcsetattr(slave.fd, TCSANOW, &raw) == 0);
+                QObject *part = nullptr;
+                for (auto *child : view->findChildren<QObject *>()) {
+                    if (child->metaObject()->indexOfMethod("openTeletype(int,bool)") >= 0) { part = child; break; }
+                }
+                QVERIFY(part);
+                // Public KPart slot: attach only our inert PTY, runShell=false.
+                // This explicitly disconnects the KPart's queued program start.
+                QVERIFY(QMetaObject::invokeMethod(part, "openTeletype", Qt::DirectConnection,
+                    Q_ARG(int, master.fd), Q_ARG(bool, false)));
+                // KPty now uses this fd. Its Session may outlive the view until
+                // deferred Qt cleanup; never close its notifier's fd ourselves.
+                master.fd = -1;
+            } else {
+#ifdef G2C_MOUSE_QTERM_INTERFACE
+                auto *teletype = qobject_cast<QTermWidgetInterface *>(view.get());
+                QVERIFY(teletype);
+                teletype->startTerminalTeletype(); // External byte sink; no shell process.
+                QVERIFY(teletype->getShellPID() <= 0);
+                QVERIFY(connect(view.get(), SIGNAL(sendData(const char*,int)),
+                    this, SLOT(recordMouseBytes(const char*,int)), Qt::DirectConnection));
+                for (auto *child : view->findChildren<QObject *>()) {
+                    if (QString::fromLatin1(child->metaObject()->className()) == "Konsole::Session") { session = child; break; }
+                }
+                QVERIFY(session);
+#else
+                QFAIL("QTermWidget interface headers required for this backend test");
+#endif
+            }
+            view->resize(800, 500);
+            view->show();
+            QTest::qWait(30);
+            QWidget *display = nullptr;
+            for (auto *child : view->findChildren<QWidget *>()) {
+                if (QString::fromLatin1(child->metaObject()->className()).endsWith("TerminalDisplay")) { display = child; break; }
+            }
+            QVERIFY(display);
+            auto feed = [&](const QByteArray &bytes) {
+                const bool sent = name == "konsole"
+                    ? ::write(slave.fd, bytes.constData(), size_t(bytes.size())) == bytes.size()
+                    : QMetaObject::invokeMethod(session, "onReceiveBlock", Qt::DirectConnection,
+                        Q_ARG(const char *, bytes.constData()), Q_ARG(int, int(bytes.size())));
+                QTest::qWait(25);
+                return sent;
+            };
+            int position = 0;
+            auto mouse = [&](QEvent::Type type, Qt::MouseButton button, Qt::MouseButtons buttons) {
+                const QPointF pos(60 + (++position % 20) * 20, 40);
+                QMouseEvent event(type, pos, display->mapToGlobal(pos.toPoint()), button, buttons, Qt::NoModifier);
+                QCoreApplication::sendEvent(display, &event);
+                QCoreApplication::processEvents();
+                QTest::qWait(5);
+                if (name == "konsole") { return terminalInput(slave.fd); }
+                const auto bytes = mouseBytes_; mouseBytes_.clear(); return bytes;
+            };
+            const QRegularExpression sgr(QStringLiteral("^\\x1b\\[<[0-9]+;[0-9]+;[0-9]+[Mm]$"));
+            auto isSgr = [&](const QByteArray &bytes) { return sgr.match(QString::fromLatin1(bytes)).hasMatch(); };
+            if (name == "konsole") { terminalInput(slave.fd); }
+            mouseBytes_.clear();
+            QVERIFY(mouse(QEvent::MouseMove, Qt::NoButton, Qt::NoButton).isEmpty());
+            // 1006 selects an encoding; it does not request mouse events.
+            QVERIFY(feed("\033[?1006h"));
+            QVERIFY(mouse(QEvent::MouseMove, Qt::NoButton, Qt::NoButton).isEmpty());
+            QVERIFY(feed("\033[?" + QByteArray::number(mode) + "h"));
+            bool initialHover = false, initialDrag = false;
+            int transition = 0;
+            for (const QByteArray &screen : {QByteArray("\033[?1049h"), QByteArray("\033[?1049l"), QByteArray("\033[?1049l")}) {
+                QVERIFY(feed(screen));
+                const auto moved = mouse(QEvent::MouseMove, Qt::NoButton, Qt::NoButton);
+                QVERIFY(moved.isEmpty() || isSgr(moved));
+                if (name == "konsole") { QCOMPARE(!moved.isEmpty(), mode == 1003); }
+                QVERIFY(isSgr(mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton)));
+                const auto dragged = mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton);
+                QVERIFY(dragged.isEmpty() || isSgr(dragged));
+                if (name == "konsole") { QCOMPARE(!dragged.isEmpty(), mode != 1000); }
+                // QTermWidget 2.1's display suppresses all no-button moves and
+                // can send a drag even in mode 1000. Measure this explicitly,
+                // do not equate packet/transition tests with mask conformance.
+                if (!transition++) { initialHover = !moved.isEmpty(); initialDrag = !dragged.isEmpty(); }
+                QCOMPARE(!moved.isEmpty(), initialHover);
+                QCOMPARE(!dragged.isEmpty(), initialDrag);
+                QVERIFY(isSgr(mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton)));
+            }
+            qInfo("MOUSE_POLICY backend=%s mode=%d generation=%d hover=%d drag=%d",
+                qPrintable(name), mode, generation, initialHover, initialDrag);
+            // 1049 did not clear capture; explicitly reset interest and encoding.
+            QVERIFY(feed("\033[?1000l\033[?1002l\033[?1003l\033[?1006l"));
+            QVERIFY(mouse(QEvent::MouseMove, Qt::NoButton, Qt::NoButton).isEmpty());
+            QVERIFY(mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton).isEmpty());
+            QVERIFY(mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton).isEmpty());
+            QVERIFY(feed("\033[?1003h\033[?1006h\033[?1003h\033[?1006h"));
+            QVERIFY(isSgr(mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton)));
+            QVERIFY(isSgr(mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton)));
+            // Resize and alternate-screen changes must not change that policy.
+            view->resize(930, 560);
+            QTest::qWait(30);
+            QVERIFY(feed("\033[?1049h\033[?1049l"));
+            QVERIFY(isSgr(mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton)));
+            QVERIFY(isSgr(mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton)));
+            // Encoding reset alone retains mouse interest and returns legacy CSI M.
+            QVERIFY(feed("\033[?1006l"));
+            const auto legacy = mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton);
+            QVERIFY(legacy.startsWith("\033[M"));
+            QCOMPARE(legacy.size(), 6);
+            QVERIFY(feed("\033[?1000l\033[?1002l\033[?1003l"));
+            view.reset();
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        }
+    }
     bool write(const QString &name, const QByteArray &bytes) {
         QFile file(fixture_.filePath(name));
         return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
@@ -50,6 +216,10 @@ class BackendTests final : public QObject {
         return result;
     }
 private Q_SLOTS:
+    void recordMouseBytes(const char *data, int length) {
+        if (length >= 0 && mouseBytes_.size() + length <= 4096) { mouseBytes_.append(data, length); }
+        else { mouseBytes_ = "INPUT_BOUND_EXCEEDED"; }
+    }
     void initTestCase() {
         if (qEnvironmentVariableIsSet("G2C_DIAG_ROOT")) {
             const auto appearance = g2ctheme::terminalAppearance();
@@ -81,6 +251,10 @@ private Q_SLOTS:
         QVERIFY(write("data/konsole/Fixture.colorscheme", scheme(false)));
     }
     void konsoleShortcutsAndLayout() {
+        for (int mode : {1000, 1002, 1003}) {
+            checkMouseModes("konsole", mode);
+            if (QTest::currentTestFailed()) { return; }
+        }
         auto *backend = load("konsole");
         QVERIFY2(backend, qPrintable(loader_->errorString()));
         QTest::failOnWarning(QRegularExpression(".*(Cannot add a null widget|Ambiguous shortcut).*"));
@@ -155,6 +329,12 @@ private Q_SLOTS:
     }
     void renderQTerm() {
         QFETCH(bool, wallpaper);
+        if (!wallpaper) {
+            for (int mode : {1000, 1002, 1003}) {
+                checkMouseModes("qtermwidget", mode);
+                if (QTest::currentTestFailed()) { return; }
+            }
+        }
         QVERIFY(write("data/konsole/Fixture.colorscheme", scheme(wallpaper)));
         QTest::failOnWarning(QRegularExpression(".*Invalid color value.*"));
         auto *backend = load("qtermwidget");
@@ -208,6 +388,20 @@ private Q_SLOTS:
             feed("\033[H\033[0mshort\033[K\r\nnew\033[J");
         }
         compareBacking();
+    }
+    void mouseModes_data() {
+        QTest::addColumn<QString>("backend");
+        QTest::addColumn<int>("mode");
+        for (const auto &name : {QStringLiteral("konsole"), QStringLiteral("qtermwidget")}) {
+            for (int mode : {1000, 1002, 1003}) {
+                QTest::newRow(qPrintable(name + QString::number(mode))) << name << mode;
+            }
+        }
+    }
+    void mouseModes() {
+        QFETCH(QString, backend);
+        QFETCH(int, mode);
+        checkMouseModes(backend, mode);
     }
     void managedMultiplexerAttachment() {
         const QString root = qEnvironmentVariable("G2C_MUX_FIXTURE");

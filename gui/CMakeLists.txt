@@ -18,10 +18,11 @@ if(G2C_BUILD_KONSOLE)
     find_package(KF6CoreAddons CONFIG QUIET)
 endif()
 
-add_executable(gpt2codex-gui main.cpp)
+set(G2C_ATTENTION_HEADERS attention_state.h attention_source.h marker_attention_source.h)
+add_executable(gpt2codex-gui main.cpp ${G2C_ATTENTION_HEADERS})
 target_link_libraries(gpt2codex-gui PRIVATE Qt6::Widgets)
 target_compile_options(gpt2codex-gui PRIVATE -Wall -Wextra -Wpedantic)
-target_compile_definitions(gpt2codex-gui PRIVATE "G2C_INSTALLED_BACKEND_DIR=\"${CMAKE_INSTALL_FULL_LIBDIR}/gpt2codex/backends\"")
+target_compile_definitions(gpt2codex-gui PRIVATE "G2C_GUI_SOURCE_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/..\"" "G2C_INSTALLED_BACKEND_DIR=\"${CMAKE_INSTALL_FULL_LIBDIR}/gpt2codex/backends\"")
 install(TARGETS gpt2codex-gui RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
 if(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
@@ -79,10 +80,11 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/backends.json" DESTINATION "${CMAKE_I
 include(CTest)
 if(BUILD_TESTING)
     find_package(Qt6 6.4 REQUIRED COMPONENTS Test)
-    add_executable(gpt2codex-gui-tests main.cpp lifecycle_tests.h)
+    add_executable(gpt2codex-gui-tests main.cpp lifecycle_tests.h ${G2C_ATTENTION_HEADERS})
     set_target_properties(gpt2codex-gui-tests PROPERTIES AUTOMOC_PATH_PREFIX ON)
     target_include_directories(gpt2codex-gui-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_definitions(gpt2codex-gui-tests PRIVATE G2C_GUI_TEST
+        "G2C_GUI_SOURCE_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/..\""
         "G2C_GUI_TEST_WORK_DIR=\"${CMAKE_CURRENT_BINARY_DIR}\""
         "G2C_INSTALLED_BACKEND_DIR=\"${CMAKE_INSTALL_FULL_LIBDIR}/gpt2codex/backends\"")
     target_link_libraries(gpt2codex-gui-tests PRIVATE Qt6::Widgets Qt6::Test)

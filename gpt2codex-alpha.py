@@ -16,12 +16,13 @@ import tempfile
 VERSION = '0.1.0~alpha1'
 ROOT = Path(__file__).resolve().parent
 TREES = ['src', 'gui', 'tests', 'debian', 'packaging', '.github', '.ai/templates', '.ai/examples']
-AI_DOCS = {'README.md','PROJECT_CONTEXT.md','SECURITY.md','WORKFLOW.md','ARCHITECTURE.md','DECISIONS.md','PLATFORMS_CI.md',
+AI_DOCS = {'README.md','PROJECT_CONTEXT.md','SECURITY.md','WORKFLOW.md','ARCHITECTURE.md','DECISIONS.md','PLATFORMS_CI.md','ATTENTION_OPT_IN.md',
            'P0_CODEX_CLIENT.md','P0_PROJECT_REGISTRY.md','P0_WORKSPACE_MANAGER.md','P0_EXISTING_PROJECTS.md',
            'P0_K2_RULES_MIGRATION.md','P0H_MCP_READONLY.md','P0I_SCREEN_QT6_DESIGN.md','P0J_READONLY_APP_SERVER.md',
            'TMUX_COMPARISON.md','TMUX_LIFECYCLE.md','ALPHA_PACKAGING.md','ALPHA_COMMIT_FILES.md'}
 HELPERS = ['gpt2codex-alpha.py', 'gpt2codex-alpha-infra.py', 'gpt2codex-alpha-container.sh',
            'gpt2codex-ci.py', 'gpt2codex-ci-test.py',
+           'gpt2codex-attention-test.py',
            'gpt2codex-alpha-rootfs-test.py',
            'gpt2codex-alpha-test.py', 'gpt2codex-project-icons-test.py', 'gpt2codex-multiplexer-test.py',
            'gpt2codex-terminal-diagnostics.py', 'gpt2codex-p0ic-qt6-test-v2.sh']

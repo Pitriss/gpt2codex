@@ -1,5 +1,30 @@
 # Decisions and open verification items
 
+## Approved marker P0-M (2026-11-02)
+
+- Opt-in new runs only: ordinary-question metadata markers with independent
+  run provenance, exact-question clear and a read-only Qt filesystem watcher.
+- The existing session records, default launches, lifecycle/recovery, actual
+  mux identities and GUI functions remain compatible. No automatic migration.
+- A small foreground launcher may exec the new Codex after establishing its
+  own binding. No extra daemon; no forced instruction/global-config override.
+- Automatic UserPromptSubmit clearing is conditional on proven run/question
+  correlation. That proof is absent; use exact-token cooperative clear instead.
+- No native approval claims, live session tests, actual Codex tests or Git
+  operations. Real CLI/sandbox validation requires separate approval.
+
+## Approved attention P0-A and proposed marker P0-M (2026-11-01)
+
+- Implement the small Qt state model, typed source boundary and status dots
+  in the existing tab slot. Default source unavailable; real sessions gray.
+- Synthetic tests cover red/yellow/green, pending priority, complete session/run
+  identity, reconnect/restart, stale events and source loss. No lifecycle changes.
+- Prioritize a waiting-only source capability for a later file-marker P0-M:
+  explicit ordinary-question marker -> yellow, clear -> unknown. Do not infer
+  red/green from marker absence or claim native approval support.
+- P0-M remains a proposal. No actual hooks, marker watcher, global AGENTS/config
+  change, Codex launch, live session operation or daemon is authorized in P0-A.
+
 ## Approved alpha CI optimization (2026-10-31)
 
 - Quick Rust, light packaging and syntax/static checks run on every push/PR.

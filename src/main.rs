@@ -2,7 +2,7 @@ use chatgpt2codex::mcp::{self, McpOptions};
 use chatgpt2codex::codex::{CodexClient, SessionPage};
 use chatgpt2codex::registry::{ProjectRegistry, Scope};
 use chatgpt2codex::screen::{self, Target as ScreenTarget};
-use chatgpt2codex::{session, project_preference, multiplexer::Multiplexer};
+use chatgpt2codex::{attention_marker, session, project_preference, multiplexer::Multiplexer};
 use chatgpt2codex::workspace::{self, BootstrapRequest};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -19,10 +19,12 @@ struct SessionOptions {
 }
 
 fn usage() {
+    eprintln!("S2 reservation candidate (runtime disabled):\n  supervisor inspect --id ID --config FILE --directory EXISTING_PRIVATE_DIR\n  supervisor claim --id ID --config FILE --directory EXISTING_PRIVATE_DIR --owner manual|queue --reservation-only [--issue-json JSON]\n  supervisor inspect-screen --id ID --config FILE --socket-directory EXISTING_PRIVATE_DIR\nClaims cannot launch processes or release unresolved reservations. Screen inspection is diagnostic only; window ownership is unverified. G2C_PROJECT_SUPERVISOR is an opt-in STOP gate, not an enable flag.");
+    eprintln!("Opt-in question attention (local only):\n  session start --id ID --attention --approve-start [other start options]\n  attention run --id ID|--bridge --multiplexer screen|tmux --approve-run [--config FILE]\n  attention mark [--run RUN_NONCE]\n  attention clear --wait WAIT_NONCE [--run RUN_NONCE]\nNo native approval support; clear always requires the exact question nonce.");
     eprintln!("Tmux lifecycle:\n  session start --id ID --multiplexer tmux [--remain-on-exit] --approve-start [--program-status] [--config FILE]\n  session list|status [other options] --program-status\n  session archive --id ID --multiplexer tmux --expect-session-id FULL_ID --expect-process-start-ticks TICKS --approve-archive [--config FILE]\nArchive never authorizes a new start; legacy slots without namespace provenance are refused.");
     eprintln!("Local multiplexer commands:\n  gpt2codex session probe|projects|list [--config FILE]\n  gpt2codex session prefer --id ID --multiplexer screen|tmux [--config FILE]\n  gpt2codex session status|attach --bridge|--id ID --multiplexer screen|tmux [--expect-session-id ID (attach only)] [--config FILE]\n  gpt2codex session start --bridge|--id ID [--multiplexer screen|tmux] [--task LABEL] --approve-start [--config FILE]");
     eprintln!(
-        "Usage:\n  gpt2codex screen probe [--config FILE]\n  gpt2codex screen list [--config FILE]\n  gpt2codex screen status|attach --bridge|--id PROJECT_ID [--config FILE]\n  gpt2codex screen start --bridge|--id PROJECT_ID [--task LABEL] --approve-start [--config FILE]\n  gpt2codex mcp stdio [--config /absolute/config.toml] [--allow-context-read]\n  gpt2codex codex probe\n  gpt2codex codex diagnostics --id PROJECT_ID [--limit 10] [--config FILE]\n  gpt2codex codex sessions --cwd /absolute/project/path [--limit 25] [--pages 1]\n  gpt2codex codex session --cwd /absolute/project/path --id UUID\n  gpt2codex workspace bootstrap --project-dir ABS --id ID --directory REPO_DIR --git-name NAME --git-email EMAIL [--codex-name NAME] [--config FILE]\n  gpt2codex workspace adopt --id PROJECT_ID --directory REPO_DIR [--dry-run] [--config FILE]\n  gpt2codex workspace health|ensure|sync-policy --id ID [--config FILE]\n  gpt2codex projects list [--config /absolute/config.toml]\n  gpt2codex project info|contexts|sessions|session|read|name --id PROJECT_ID [--config /absolute/config.toml]\n    project sessions: [--limit 25] [--pages 1]\n    project session: --thread UUID\n    project read: --scope global|project --file ALLOWLISTED_PATH\n    project name: --task SHORT_TASK\n\nP0 mode: read-only MCP; workspace writes and screen start/attach require explicit LOCAL CLI invocation, never exposed via MCP."
+        "Usage:\n  gpt2codex screen probe [--config FILE]\n  gpt2codex screen list [--config FILE]\n  gpt2codex screen status|attach --bridge|--id PROJECT_ID [--config FILE]\n  gpt2codex screen start --bridge|--id PROJECT_ID [--task LABEL] [--anchor-only (project only)] --approve-start [--config FILE]\n  gpt2codex mcp stdio [--config /absolute/config.toml] [--allow-context-read]\n  gpt2codex codex probe\n  gpt2codex codex diagnostics --id PROJECT_ID [--limit 10] [--config FILE]\n  gpt2codex codex sessions --cwd /absolute/project/path [--limit 25] [--pages 1]\n  gpt2codex codex session --cwd /absolute/project/path --id UUID\n  gpt2codex workspace bootstrap --project-dir ABS --id ID --directory REPO_DIR --git-name NAME --git-email EMAIL [--codex-name NAME] [--config FILE]\n  gpt2codex workspace adopt --id PROJECT_ID --directory REPO_DIR [--dry-run] [--config FILE]\n  gpt2codex workspace health|ensure|sync-policy --id ID [--config FILE]\n  gpt2codex projects list [--config /absolute/config.toml]\n  gpt2codex project info|contexts|sessions|session|read|name --id PROJECT_ID [--config /absolute/config.toml]\n    project sessions: [--limit 25] [--pages 1]\n    project session: --thread UUID\n    project read: --scope global|project --file ALLOWLISTED_PATH\n    project name: --task SHORT_TASK\n\nP0 mode: read-only MCP; workspace writes and screen start/attach require explicit LOCAL CLI invocation, never exposed via MCP."
     );
 }
 
@@ -350,6 +352,7 @@ struct ScreenOptions {
     task: Option<String>,
     approve_start: bool,
     approve_recover: bool,
+    anchor_only: bool,
 }
 
 fn parse_screen_options(args: impl Iterator<Item = String>, action: &str) -> Result<ScreenOptions, &'static str> {
@@ -359,6 +362,7 @@ fn parse_screen_options(args: impl Iterator<Item = String>, action: &str) -> Res
         match flag.as_str() {
             "--bridge" if matches!(action, "start" | "attach" | "status") && !values.bridge => values.bridge = true,
             "--approve-start" if action == "start" && !values.approve_start => values.approve_start = true,
+            "--anchor-only" if action == "start" && !values.anchor_only => values.anchor_only = true,
             "--approve-recover" if action == "recover" && !values.approve_recover => values.approve_recover = true,
             "--config" if values.config.is_none() => values.config = Some(PathBuf::from(args.next().ok_or("missing config path")?)),
             "--id" if matches!(action, "start" | "attach" | "status" | "recover") && values.id.is_none() => values.id = Some(args.next().ok_or("missing project ID")?),
@@ -370,16 +374,17 @@ fn parse_screen_options(args: impl Iterator<Item = String>, action: &str) -> Res
         "start" | "status" | "attach" => {
             if values.bridge == values.id.is_some() { return Err("specify exactly one of --bridge or --id"); }
             if action == "start" && !values.approve_start { return Err("screen start requires --approve-start"); }
-            if action != "start" && (values.task.is_some() || values.approve_start) { return Err("unexpected screen option"); }
+            if action != "start" && (values.task.is_some() || values.approve_start || values.anchor_only) { return Err("unexpected screen option"); }
+            if values.anchor_only && values.bridge { return Err("anchor-only start requires --id PROJECT_ID"); }
             if values.approve_recover { return Err("unexpected recovery approval"); }
         }
         "recover" => {
             if values.bridge || values.id.is_none() { return Err("recovery requires --id; bridge slot is protected"); }
             if !values.approve_recover { return Err("screen recover requires --approve-recover"); }
-            if values.task.is_some() || values.approve_start { return Err("unexpected screen option"); }
+            if values.task.is_some() || values.approve_start || values.anchor_only { return Err("unexpected screen option"); }
         }
         "list" | "probe" => {
-            if values.bridge || values.id.is_some() || values.task.is_some() || values.approve_start || values.approve_recover {
+            if values.bridge || values.id.is_some() || values.task.is_some() || values.approve_start || values.approve_recover || values.anchor_only {
                 return Err("list/probe accepts only --config");
             }
         }
@@ -405,7 +410,15 @@ fn run_screen(action: &str, args: impl Iterator<Item = String>) -> Result<(), Bo
     }
     let target = if opts.bridge { ScreenTarget::Bridge } else { ScreenTarget::Project(opts.id.as_deref().ok_or("project required")?) };
     match action {
-        "start" => print_screen_status(screen::start(&config, target, opts.task.as_deref().unwrap_or(if opts.bridge { "Bridge" } else { "Codex" }))?),
+        "start" => {
+            let task = opts.task.as_deref().unwrap_or(if opts.bridge { "Bridge" } else { "Codex" });
+            let status = if opts.anchor_only {
+                screen::start_anchor(&config, target, task)?
+            } else {
+                screen::start(&config, target, task)?
+            };
+            print_screen_status(status);
+        }
         "status" => print_screen_status(screen::status(&config, target)?),
         "attach" => screen::attach(&config, target)?,
         "recover" => {
@@ -431,6 +444,7 @@ struct MultiplexerOptions {
     remain_on_exit: bool,
     approve_archive: bool,
     program_status: bool,
+    attention: bool,
 }
 
 fn parse_multiplexer_options(action: &str, mut args: impl Iterator<Item = String>) -> Result<MultiplexerOptions, &'static str> {
@@ -449,6 +463,7 @@ fn parse_multiplexer_options(action: &str, mut args: impl Iterator<Item = String
             "--expect-process-start-ticks" if matches!(action, "attach" | "archive") && opts.expected_ticks.is_none() => opts.expected_ticks = Some(args.next().ok_or("missing process generation")?.parse().map_err(|_| "invalid process generation")?),
             "--approve-start" if action == "start" && !opts.approved => opts.approved = true,
             "--remain-on-exit" if action == "start" && !opts.remain_on_exit => opts.remain_on_exit = true,
+            "--attention" if action == "start" && !opts.attention => opts.attention = true,
             "--approve-archive" if action == "archive" && !opts.approve_archive => opts.approve_archive = true,
             "--program-status" if matches!(action, "list" | "status" | "start") && !opts.program_status => opts.program_status = true,
             _ => return Err("unknown or repeated session option"),
@@ -461,6 +476,7 @@ fn parse_multiplexer_options(action: &str, mut args: impl Iterator<Item = String
         return Err("actual multiplexer required; attachment never follows project preference");
     }
     if action == "start" && !opts.approved { return Err("session start requires --approve-start"); }
+    if opts.attention && opts.bridge { return Err("Bridge start remains a shell; --attention requires --id"); }
     if action == "archive" && (!opts.approve_archive || opts.mux != Some(Multiplexer::Tmux) || opts.expected.is_none() || opts.expected_ticks.is_none()) {
         return Err("archive requires tmux, --approve-archive and exact expected session ID/start ticks");
     }
@@ -513,7 +529,7 @@ fn run_session(action: &str, args: impl Iterator<Item = String>) -> Result<(), B
         }
         "start" | "status" => {
             if action == "start" {
-                session::start_with_options(&config, mux, target, opts.task.as_deref().unwrap_or(if opts.bridge { "Bridge" } else { "Codex" }), opts.remain_on_exit)?;
+                session::start_with_attention(&config, mux, target, opts.task.as_deref().unwrap_or(if opts.bridge { "Bridge" } else { "Codex" }), opts.remain_on_exit, opts.attention)?;
             }
             print_managed_status(session::details(&config, mux, target)?, opts.program_status);
         }
@@ -528,9 +544,41 @@ fn run_session(action: &str, args: impl Iterator<Item = String>) -> Result<(), B
     Ok(())
 }
 
+fn run_attention(action: &str, mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(action, "run" | "mark" | "clear") { return Err("unknown attention operation".into()); }
+    let (mut config, mut id, mut mux, mut run, mut wait) = (None, None, None, None, None);
+    let (mut bridge, mut approved) = (false, false);
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--config" if action == "run" && config.is_none() => config = Some(PathBuf::from(args.next().ok_or("missing config")?)),
+            "--id" if action == "run" && id.is_none() => id = Some(args.next().ok_or("missing project")?),
+            "--bridge" if action == "run" && !bridge => bridge = true,
+            "--multiplexer" if action == "run" && mux.is_none() => mux = Some(Multiplexer::parse(&args.next().ok_or("missing multiplexer")?)?),
+            "--approve-run" if action == "run" && !approved => approved = true,
+            "--run" if action != "run" && run.is_none() => run = Some(args.next().ok_or("missing run nonce")?),
+            "--wait" if action == "clear" && wait.is_none() => wait = Some(args.next().ok_or("missing exact wait nonce")?),
+            _ => return Err("unknown or repeated attention option".into()),
+        }
+    }
+    if action == "run" {
+        if !approved || bridge == id.is_some() || mux.is_none() { return Err("attention run requires target, actual mux and --approve-run".into()); }
+        let config = config.unwrap_or(default_config_path()?);
+        if !config.is_absolute() { return Err("attention config must be absolute".into()); }
+        let target = if bridge { ScreenTarget::Bridge } else { ScreenTarget::Project(id.as_deref().ok_or("project required")?) };
+        return Ok(attention_marker::run(&config, target, mux.ok_or("actual mux required")?)?);
+    }
+    let run = run.or_else(|| env::var("G2C_ATTENTION_RUN").ok()).ok_or("instrumented attention run required")?;
+    if action == "mark" { println!("ATTENTION_WAIT={}", attention_marker::mark(&run)?); }
+    else { println!("ATTENTION_CLEAR={}", if attention_marker::clear(&run, &wait.ok_or("clear requires --wait")?)? { "ok" } else { "absent" }); }
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let group = args.next().ok_or("missing command")?;
+    if group == "supervisor" {
+        return chatgpt2codex::project_supervisor::cli(args).map_err(Into::into);
+    }
     if matches!(group.as_str(), "--help" | "-h") {
         if args.next().is_some() { return Err("help does not accept arguments".into()); }
         usage();
@@ -540,6 +588,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let action = args.next().ok_or("missing session subcommand")?;
         return run_session(&action, args);
     }
+    if group == "attention" { return run_attention(&args.next().ok_or("missing attention operation")?, args); }
     if group == "screen" {
         let action = args.next().ok_or("missing screen subcommand")?;
         if !matches!(action.as_str(), "probe" | "list" | "status" | "start" | "attach" | "recover") {
@@ -643,6 +692,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attention_run_requires_explicit_target_mux_and_approval() {
+        for args in [vec!["--id", "alpha", "--multiplexer", "screen"],
+            vec!["--approve-run", "--bridge", "--id", "alpha", "--multiplexer", "tmux"],
+            vec!["--id", "alpha", "--approve-run"], vec!["--shell", "injected"]] {
+            assert!(run_attention("run", args.into_iter().map(str::to_owned)).is_err());
+        }
+        assert!(run_attention("clear", ["--wait"].into_iter().map(str::to_owned)).is_err());
+        assert!(run_attention("mark", ["--run", "../bad"].into_iter().map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn attention_session_start_is_strictly_opt_in() {
+        let base = ["--id", "alpha", "--approve-start"];
+        assert!(!parse_multiplexer_options("start", base.into_iter().map(str::to_owned)).unwrap().attention);
+        assert!(parse_multiplexer_options("start", base.into_iter().chain(["--attention"]).map(str::to_owned)).unwrap().attention);
+        for (action, args) in [("start", vec!["--bridge", "--attention", "--approve-start"]),
+            ("status", vec!["--id", "alpha", "--multiplexer", "screen", "--attention"]),
+            ("start", vec!["--id", "alpha", "--attention"])] {
+            assert!(parse_multiplexer_options(action, args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn workspace_requires_explicit_bootstrap_authorization_arguments() {
         assert!(parse_workspace_options(vec!["--id".into(), "gpt2codex".into()].into_iter(), "bootstrap").is_err());
         assert!(parse_workspace_options(vec!["--id".into(), "gpt2codex".into(), "--shell".into(), "yes".into()].into_iter(), "health").is_err());
@@ -664,6 +736,11 @@ mod tests {
         assert!(parse_screen_options(vec!["--id".into(), "k2-smb".into(), "--bridge".into(), "--approve-start".into()].into_iter(), "start").is_err());
         assert!(parse_screen_options(vec!["--bridge".into(), "--approve-start".into()].into_iter(), "start").is_ok());
         assert!(parse_screen_options(vec!["--id".into(), "k2-smb".into(), "--approve-start".into()].into_iter(), "start").is_ok());
+        assert!(parse_screen_options(vec!["--id".into(), "k2-smb".into(), "--anchor-only".into(), "--approve-start".into()].into_iter(), "start").unwrap().anchor_only);
+        assert!(parse_screen_options(vec!["--id".into(), "k2-smb".into(), "--anchor-only".into()].into_iter(), "start").is_err());
+        assert!(parse_screen_options(vec!["--bridge".into(), "--anchor-only".into(), "--approve-start".into()].into_iter(), "start").is_err());
+        assert!(parse_screen_options(vec!["--id".into(), "k2-smb".into(), "--anchor-only".into()].into_iter(), "status").is_err());
+        assert!(parse_screen_options(vec!["--id".into(), "k2-smb".into(), "--anchor-only".into(), "--approve-recover".into()].into_iter(), "recover").is_err());
         assert!(parse_screen_options(vec!["--bridge".into(), "--approve-start".into()].into_iter(), "list").is_err());
         assert!(parse_screen_options(vec!["--bridge".into(), "--cmd".into(), "rm".into(), "--approve-start".into()].into_iter(), "start").is_err());
         assert!(parse_screen_options(vec!["--id".into(), "k2-smb".into()].into_iter(), "recover").is_err());

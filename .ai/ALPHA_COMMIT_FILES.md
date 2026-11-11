@@ -15,11 +15,12 @@ The reviewed synthetic-redaction-header exceptions are pinned to complete
 file hashes; no credentials are exempted by path. Automated heuristic scanning
 is useful evidence, not a mathematical proof of secret absence.
 
-Count: **87 files**.
+Count: **94 files**.
 
 - `.ai/ALPHA_COMMIT_FILES.md`
 - `.ai/ALPHA_PACKAGING.md`
 - `.ai/ARCHITECTURE.md`
+- `.ai/ATTENTION_OPT_IN.md`
 - `.ai/DECISIONS.md`
 - `.ai/P0H_MCP_READONLY.md`
 - `.ai/P0I_SCREEN_QT6_DESIGN.md`
@@ -67,6 +68,7 @@ Count: **87 files**.
 - `debian/source/format`
 - `gpt2codex-alpha-container.sh`
 - `gpt2codex-alpha-infra.py`
+- `gpt2codex-attention-test.py`
 - `gpt2codex-alpha-rootfs-test.py`
 - `gpt2codex-alpha-test.py`
 - `gpt2codex-alpha.py`
@@ -79,10 +81,14 @@ Count: **87 files**.
 - `gui/CMakeLists.txt`
 - `gui/README.md`
 - `gui/backend_interface.h`
+- `gui/attention_source.h`
+- `gui/attention_state.h`
 - `gui/backend_konsole.cpp`
 - `gui/backend_qtermwidget.cpp`
 - `gui/backend_tests.cpp`
 - `gui/lifecycle_tests.h`
+- `gui/marker_attention_source.h`
+- `gui/marker_test_fixture.h`
 - `gui/main.cpp`
 - `gui/paste_shortcut_filter.h`
 - `gui/project_multiplexer_settings.h`
@@ -91,6 +97,7 @@ Count: **87 files**.
 - `packaging/ci-lock.json`
 - `packaging/reviewed-synthetic-secrets.json`
 - `src/codex.rs`
+- `src/attention_marker.rs`
 - `src/lib.rs`
 - `src/main.rs`
 - `src/mcp.rs`

@@ -1,5 +1,14 @@
 # Project context
 
+The approved P0-A/P0-M attention work adds a shared tab model and a real
+waiting-only marker source (2026-11-02). New explicitly instrumented Codex runs
+may mark/clear ordinary questions in private XDG_RUNTIME_DIR metadata; existing
+uninstrumented sessions remain gray. No daemon, app-server monitor or global
+hook/config was added. UserPromptSubmit lacks proven question-generation
+correlation, so exact-token clear is used. Native approvals and actual Codex
+CLI/sandbox interoperability are unverified. See [GUI](../gui/README.md#p0-m-ordinary-question-markers-2026-11-02)
+and the private handoff. This supersedes older attention deferrals.
+
 The approved 2026-10-31 CI optimization separates always-on quick checks from
 conditional full Debian amd64 CI. Release tags and manual full runs also build
 experimental arm64/armhf. Devuan remains supported with optional non-blocking
@@ -20,8 +29,8 @@ actual local results and blockers; prepared CI is not a passed hosted run.
 
 The approved 2026-10-28 GUI phase adds project tab icons from a confined
 `.icon.png` or KDE theme fallback, registered-root/actual-multiplexer tooltips
-and empty layout space for a future indicator. No state indicator/Attention
-Manager or lifecycle change is included. See [GUI](../gui/README.md) and the
+and layout space used by the newer P0-A indicator above. That original phase
+included no Attention Manager or lifecycle change. See [GUI](../gui/README.md) and the
 latest handoff for tests and manual verification. This supersedes older
 icon-deferral statements; yellow-artifact diagnosis remains deferred.
 

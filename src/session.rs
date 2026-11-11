@@ -361,11 +361,19 @@ pub fn start_with_options(
     task: &str,
     remain_on_exit: bool,
 ) -> Result<Status> {
+    start_with_attention(config, mux, target, task, remain_on_exit, false)
+}
+
+pub fn start_with_attention(
+    config: &Path, mux: Multiplexer, target: Target<'_>, task: &str, remain_on_exit: bool, attention: bool,
+) -> Result<Status> {
+    crate::project_supervisor::manual_project_start_gate(config, target)?;
+    let attention_args = if attention { Some(crate::attention_marker::launch_arguments(config, target, mux)?) } else { None };
     if mux == Multiplexer::Screen {
         if remain_on_exit {
             return Err(err("remain-on-exit is a tmux-only start option"));
         }
-        return screen::start(config, target, task);
+        return screen::start_with_attention(config, target, task, attention);
     }
     screen::validate_task(task)?;
     let registry =
@@ -437,7 +445,8 @@ pub fn start_with_options(
         .arg("--")
         .arg("/usr/bin/env")
         .arg("--")
-        .arg(&program);
+        .arg(attention_args.as_ref().map(|a| Path::new(&a[0])).unwrap_or(&program));
+    if let Some(args) = attention_args { launch.args(&args[1..]); }
     if target == Target::Bridge {
         launch.arg("-l");
     }

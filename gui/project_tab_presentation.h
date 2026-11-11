@@ -1,8 +1,10 @@
 // Presentation only: roots come from the existing read-only project registry.
 #pragma once
 
+#include "attention_state.h"
 #include <QBuffer>
 #include <QIconEngine>
+#include <QPainter>
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -11,8 +13,7 @@
 namespace g2ctabs {
 
 constexpr int iconPixels = 20;
-// Empty layout space between the icon and native tab text. No status object,
-// status painting or data source exists yet; a future indicator can use it.
+// Existing reserved space between the icon and native text; no tab-height change.
 constexpr int futureIndicatorPixels = 8;
 constexpr int maxIconBytes = 1024 * 1024;
 constexpr int maxIconDimension = 1024;
@@ -73,17 +74,37 @@ inline QImage readProjectIcon(const QString &registeredRoot) {
 }
 
 // Keep native tab text, elision, close buttons and keyboard behavior. Only the
-// icon rectangle includes an empty future-indicator slot; artwork stays 20x20.
+// icon rectangle includes the attention slot; artwork stays 20x20.
+inline QColor indicatorColor(g2cattention::State state) {
+    switch (state) {
+    case g2cattention::State::Working: return QColor(211, 47, 47);
+    case g2cattention::State::Waiting: return QColor(251, 192, 45);
+    case g2cattention::State::Completed: return QColor(56, 142, 60);
+    default: return QColor(128, 128, 128);
+    }
+}
+
 class TabIconEngine final : public QIconEngine {
 public:
-    explicit TabIconEngine(QIcon icon) : icon_(std::move(icon)) {}
-    QIconEngine *clone() const override { return new TabIconEngine(icon_); }
+    explicit TabIconEngine(QIcon icon, g2cattention::View view = {}, QColor outline = Qt::black)
+        : icon_(std::move(icon)), view_(view), outline_(std::move(outline)) {}
+    QIconEngine *clone() const override { return new TabIconEngine(icon_, view_, outline_); }
     void paint(QPainter *painter, const QRect &rect, QIcon::Mode mode, QIcon::State state) override {
         const QSize area = decorationSize().scaled(rect.size(), Qt::KeepAspectRatio);
         const int side = area.height();
         const int x = rect.x() + (rect.width() - area.width()) / 2
             + (QGuiApplication::layoutDirection() == Qt::RightToLeft ? area.width() - side : 0);
         icon_.paint(painter, QRect(x, rect.y() + (rect.height() - side) / 2, side, side), Qt::AlignCenter, mode, state);
+        const qreal scale = side / qreal(iconPixels);
+        const qreal left = rect.x() + (rect.width() - area.width()) / 2.0;
+        const qreal cx = left + (QGuiApplication::layoutDirection() == Qt::RightToLeft
+            ? futureIndicatorPixels / 2.0 : iconPixels + futureIndicatorPixels / 2.0) * scale;
+        painter->save();
+        painter->setRenderHint(QPainter::Antialiasing);
+        painter->setPen(QPen(outline_, scale));
+        painter->setBrush(indicatorColor(view_.state));
+        painter->drawEllipse(QPointF(cx, rect.y() + rect.height() / 2.0), 3 * scale, 3 * scale);
+        painter->restore();
     }
     QSize actualSize(const QSize &size, QIcon::Mode, QIcon::State) override {
         return decorationSize().scaled(size, Qt::KeepAspectRatio);
@@ -97,9 +118,11 @@ public:
     }
 private:
     QIcon icon_;
+    g2cattention::View view_;
+    QColor outline_;
 };
 
-inline QIcon tabIcon(const QImage &custom, bool bridge, QWidget *widget) {
+inline QIcon projectIcon(const QImage &custom, bool bridge, QWidget *widget) {
     QIcon icon;
     if (!custom.isNull()) {
         // Keep enough source pixels for high-DPI screens, with transparent
@@ -115,7 +138,12 @@ inline QIcon tabIcon(const QImage &custom, bool bridge, QWidget *widget) {
         icon = QIcon::fromTheme(bridge ? QStringLiteral("network-connect") : QStringLiteral("utilities-terminal"),
             widget->style()->standardIcon(bridge ? QStyle::SP_DriveNetIcon : QStyle::SP_ComputerIcon));
     }
-    return QIcon(new TabIconEngine(icon));
+    return icon;
+}
+
+inline QIcon tabIcon(const QImage &custom, bool bridge, QWidget *widget, g2cattention::View view = {}) {
+    return QIcon(new TabIconEngine(projectIcon(custom, bridge, widget), view,
+        widget->palette().color(QPalette::WindowText)));
 }
 
 // Parse only the existing registry listing, not session labels or preferences.
@@ -163,20 +191,24 @@ public:
     void setRoots(const QHash<QString, QString> &roots) { roots_ = roots; icons_.clear(); }
     void invalidateIcons() { icons_.clear(); }
     void apply(QTabWidget *tabs, QWidget *page, const QString &id, const QString &actualMultiplexer,
-               const QString &title, const QString &task) {
+               const QString &title, const QString &task, g2cattention::View attention = {}) {
         const int index = tabs->indexOf(page);
         if (index < 0) { return; }
         const bool bridge = id == QStringLiteral("bridge");
         const QString root = roots_.value(bridge ? QStringLiteral("gpt2codex") : id);
-        if (!icons_.contains(id)) { icons_.insert(id, tabIcon(readProjectIcon(root), bridge, tabs)); }
+        if (!icons_.contains(id)) { icons_.insert(id, projectIcon(readProjectIcon(root), bridge, tabs)); }
         tabs->setIconSize(decorationSize());
-        tabs->setTabIcon(index, icons_.value(id));
+        // Only artwork is shared per project. Each page gets its own state.
+        tabs->setTabIcon(index, QIcon(new TabIconEngine(icons_.value(id), attention,
+            tabs->palette().color(QPalette::WindowText))));
         tabs->setTabText(index, title);
         const QString tooltip = id + QStringLiteral(" | ") + task
             + QStringLiteral(" [%1]\nProjekt: %2").arg(actualMultiplexer,
-                root.isEmpty() ? QStringLiteral("cesta není ověřena v registru") : root);
+                root.isEmpty() ? QStringLiteral("cesta není ověřena v registru") : root)
+            + QStringLiteral("\nCodex: ") + g2cattention::description(attention);
         // Paths/labels are text, never tooltip HTML capable of loading images.
         tabs->setTabToolTip(index, QStringLiteral("<qt>") + tooltip.toHtmlEscaped().replace(QLatin1Char('\n'), QStringLiteral("<br/>")) + QStringLiteral("</qt>"));
+        page->setAccessibleDescription(tooltip);
     }
 private:
     QHash<QString, QString> roots_;

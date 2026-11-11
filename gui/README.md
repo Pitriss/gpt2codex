@@ -375,9 +375,8 @@ theme lacks that name, Qt supplies a standard terminal/computer or network
 fallback. User files, permissions and KDE configuration are never modified.
 
 Artwork fits a 20 by 20 logical-pixel square without distortion, with source
-pixels retained for high-DPI displays. An empty 8-pixel horizontal space after
-the icon prepares the layout for a future state indicator; no indicator,
-Attention Manager or state feed is implemented. Native Qt tab text, elision,
+pixels retained for high-DPI displays. The reserved 8-pixel space after the
+icon now holds the P0-A attention indicator described below. Native Qt tab text, elision,
 close buttons, theme and keyboard navigation remain in use. Palette/style
 changes refresh the themed icons. Registry refresh invalidates icon caches,
 so replacing/removing `.icon.png` is visible on the next refresh. A failed
@@ -411,3 +410,231 @@ position or preference. Do not enter test text into live Codex sessions. A
 synthetic fixture start still needs its own explicit approval; icons themselves
 never start, detach, archive or restart sessions. Desktop visual verification
 is separate from offscreen regression results.
+
+## P0-A attention indicators (2026-11-01)
+
+Each terminal tab has a six-pixel status dot in the existing eight-pixel slot:
+red for a verified active turn, yellow for verified pending approval/input,
+green for a verified completed turn, gray for unavailable/unverified evidence.
+Yellow takes priority over completion while a pending request remains. Green
+means completion of the current turn, not proof that an entire task succeeded.
+Fixed text in the tab tooltip and page accessibility description explains the
+state without displaying conversation, command or question contents.
+
+The P0-A model initially shipped with an unavailable source. P0-M below adds
+the real waiting-only marker source; **uninstrumented sessions remain gray**.
+The model itself still performs no filesystem/process I/O. The fake source is
+compiled only into the test binary; synthetic colors cannot be enabled in the GUI.
+
+One in-memory manager binds observations to project, actual multiplexer, full
+session identity and process generation, plus a separate verified run/source/
+thread binding and random subscription epoch. Event delivery cannot establish
+that binding itself. The manager rejects old subscriptions, duplicates and old
+turns; incomplete evidence, sequence gaps, source loss and expired evidence
+become gray until a new subscription and initial snapshot. A GUI restart starts
+unknown and needs a fresh verified source snapshot; display colors are not
+persisted. The state model performs no filesystem/process I/O.
+
+Terminal detach suspends the observation; reconnect needs fresh evidence.
+Inactive tabs keep their observations. Presentation callbacks only update
+icons/tooltips; they cannot attach, detach, start, stop or archive a terminal.
+Project artwork remains 20x20, with native Qt titles, height, elision and RTL/DPI
+behavior. Only artwork is shared per project, never the state of two mux slots.
+
+The source interface supports a **waiting-only** capability for P0-M.
+A verified marker assertion can produce yellow; clearing it
+produces gray, never red/green. It needs no app-server thread ID. Verified binding
+changes can update presentation immediately, independently of session polling.
+The P0-A fake tests remain unchanged in purpose. P0-M does not claim native
+approval coverage or automatic UserPromptSubmit clearing.
+
+Run the isolated release build, safe self-test and all GUI/backend regressions:
+
+```sh
+python3 ./gpt2codex-attention-test.py
+```
+
+This helper builds the Rust CLI and runs focused marker/CLI tests, then uses the existing CMake/CTest targets with fresh build/output and
+private HOME/XDG/runtime/SCREENDIR. It does not invoke the historical build
+helper (which calls Git and writes target/release). A fixed CLI fixture supplies
+only synthetic metadata; Git/Codex/screen/tmux calls are guarded and rejected.
+Tests cover three simultaneous states, waiting-only create/clear, late binding,
+full/run/view identity changes, duplicates, reconnect/restart, stale callbacks,
+source loss/freshness, project artwork and both existing native backend suites.
+No desktop GUI or live session is used; visual desktop verification is separate.
+
+## P0-M diagnostic categories and mouse tests (2026-11-06)
+
+Identity rejection retains `attention run identity unconfirmed; no write` and
+appends a fixed `reason=...`, with no environment, process arguments or text
+payload. `live()` remains a boolean with the same fail-closed checks. No
+RunBinding format, launcher, session record, sandbox policy or GUI marker source was
+changed. Examples of categories:
+
+| Category | Meaning |
+| --- | --- |
+| `invalid_numeric_identity`, `invalid_binding`, `session_identity_mismatch` | Invalid identity fields, version or session shape |
+| `process_identity_collision`, `run_nonce_mismatch` | Conflicting process identities or wrong run generation |
+| `boot_unavailable`, `boot_mismatch` | Boot evidence unavailable or changed |
+| `server_namespace_unavailable`, `codex_namespace_unavailable` | The corresponding namespace cannot be read in this procfs view |
+| `server_namespace_mismatch`, `codex_namespace_mismatch` | Readable namespace differs from the binding |
+| `server_process_unconfirmed`, `codex_process_unconfirmed` | Process ownership, live state or procfs cannot be confirmed |
+| `server_generation_mismatch`, `codex_generation_mismatch` | Process start ticks differ |
+| `run_ancestry_unconfirmed`, `caller_ancestry_unconfirmed` | Required ancestry cannot be established |
+
+An unavailable namespace does not prove that the host process died. A fresh
+Linux sandbox PID namespace can make a valid host binding unverifiable from
+the command tool. This patch explains the refusal; it does not make such a
+helper work across namespaces. Never remove identity checks or change metadata
+to turn it into success. The exact historical p0s failing predicate and the
+actual Codex mark/yellow/clear/gray roundtrip remain unconfirmed. Native
+approvals, automatic hooks and SO_PEERCRED transport remain out of scope.
+
+Targeted synthetic checks, from the ready repository root:
+
+```sh
+python3 ./gpt2codex-attention-test.py --diagnostic-only
+```
+
+This uses a fresh private Rust build/marker test target, synthetic Python
+ancestors, a real bwrap PID namespace and the backend-test target only. It
+does not launch the GUI application, Codex or a screen/tmux server. Missing
+bwrap or failed kernel namespace preconditions are **NOT RUN**, with a nonzero
+exit, never a namespace PASS. A missing procfs/identity produces no marker;
+sibling callers and delayed clear A cannot alter the current question B.
+`--namespace-cli PATH` repeats only that regression using an already built
+private `.tmp/.../gpt2codex`, without repeating the build or Qt tests.
+
+Native offscreen `mouseModes` tests use natively allocated inert teletype
+surfaces, with no shell/program start. Konsole KPart uses its public
+`openTeletype(fd, false)` slot and QTermWidget its external teletype API.
+Synthetic pointer events exercise capture/encoding changes, repeated set/reset,
+resize and replacement with a fresh view. Existing Konsole/paste and QTerm
+render CTest entries also execute the new mode matrix.
+
+Modes `1000/1002/1003` request mouse events; `1006` selects SGR encoding;
+`1049` selects the alternate screen. Tests verify that alternate-screen
+transitions retain capture, resetting capture stops reports, and resetting
+only `1006` returns legacy encoding. Konsole's event masks are checked.
+QTermWidget 2.1.0's pointer path has different behavior: no no-button hover
+reports in `1003`, and a drag may be reported even in `1000`. The tests record
+that policy separately and verify its stability across screen transitions;
+their PASS does **not** assert complete mouse-mask conformance for QTermWidget.
+They neither suppress QMouseEvent nor add filtering to application input.
+
+For the input-side GNU screen parser only, using the reviewed cached upstream
+4.9.1 `display.c` when it is still present:
+
+```sh
+python3 ./gpt2codex-terminal-diagnostics.py --mouse-test --screen-source .tmp/p0m-diagnosis-t1n33edr/screen-display.c
+```
+
+Otherwise supply the same `display.c` from the official
+[screen 4.9.1 archive](https://ftp.gnu.org/gnu/screen/screen-4.9.1.tar.gz).
+The helper checks its exact SHA-256 before compiling an extracted parser with
+a synthetic canvas/sink in `.tmp`. It runs no server or GUI and logs only
+counts/status. Tests cover whole, split and coalesced SGR, press/release/motion,
+coordinates above 223, ordinary keyboard and bracketed paste input. The
+summary explicitly distinguishes the input parser from output mode `1049`
+and native backend tests. It is not proof of a live Konsole/Codex input leak.
+`--no-alt-screen` is not a general mouse-mode reset and is not added by this
+patch. Actual TUI interoperability still needs a separately approved test.
+
+## P0-M ordinary-question markers (2026-11-02)
+
+The default Qt source now reads only private metadata under
+`$XDG_RUNTIME_DIR/gpt2codex/attention/`. A verified waiting marker makes its
+specific attached session tab yellow; removal makes it gray. Marker absence
+never implies working/completed. This is a cooperative ordinary-question signal,
+not a guarantee that the model will remember to mark every question. Native
+approval dialogs are not covered. No app-server monitor or daemon was added.
+
+Instrumentation is **opt-in for a new approved run**. Existing sessions,
+preferences, old registry formats, sockets and default launch argv are preserved.
+An operator can request a future new project session with:
+
+```sh
+gpt2codex session start --id PROJECT_ID --multiplexer screen --attention --approve-start
+gpt2codex session start --id PROJECT_ID --multiplexer tmux --attention --remain-on-exit --approve-start
+```
+
+These commands are alternatives, not instructions to start duplicate Codexes.
+They were not run on user sessions during development. Slot/start approval and
+identity rules still apply. Bridge start remains a shell; `--attention --bridge`
+is rejected. For a separately approved **new** Codex in a registered Bridge
+shell, the explicit local `attention run --bridge --multiplexer screen|tmux
+--approve-run` wrapper is also available. Never invoke it alongside an existing
+Codex merely to retrofit attention.
+
+The small foreground wrapper reads its own registered slot, verifies project
+root, exact mux/server generation and parent ancestry, and mints a fresh run
+nonce with process start ticks, boot ID and PID namespace. tmux also checks its
+recorded socket identity. It refuses a second live instrumented run in that slot.
+It then **execs** Codex, preserving the bound PID; no supervisor/daemon remains.
+Only this new opt-in command adds `--add-dir` for its own private run directory.
+It never rewrites or migrates the persistent session record.
+
+The run exports `G2C_ATTENTION_RUN`, `G2C_ATTENTION_HELPER` and
+`G2C_ATTENTION_INSTRUCTIONS`. It copies the fixed local
+[opt-in instruction](../.ai/ATTENTION_OPT_IN.md) into that run directory.
+The operator must explicitly ask the new Codex to read the file named by
+`G2C_ATTENTION_INSTRUCTIONS`; no developer instructions are silently overwritten,
+no initial model prompt is injected and no global AGENTS/config is edited.
+
+Before an ordinary question, the instructed Codex executes:
+
+```sh
+"$G2C_ATTENTION_HELPER" attention mark
+```
+
+It retains the returned `ATTENTION_WAIT` question identifier. On the user's
+reply, before further work or a new question, it executes:
+
+```sh
+"$G2C_ATTENTION_HELPER" attention clear --wait EXACT_SAVED_IDENTIFIER
+```
+
+Clear requires that precise question generation, under the same per-run lock.
+A late clear for A refuses to remove B. Repeated mark is idempotent while the
+same question is waiting. No prompt, answer or question is accepted as an
+argument or stored. The helper also checks that its caller belongs to the
+bound live run; it refuses unrelated callers and uncertain PID namespaces.
+
+**Automatic UserPromptSubmit clear is not installed, including in fixtures.**
+The installed 0.163.0 package contains that hook, but the
+[documented fields](https://learn.chatgpt.com/docs/hooks) do not establish
+correlation with our question nonce. Capturing the newest marker
+after a delayed hook starts could delete a newer question. The exact-token
+clear above is functional and tested; an automatic hook requires additional
+version-specific proof. No native approval hooks were installed or claimed.
+
+Bindings/markers are strict version-1 canonical JSON, regular private files
+(at most 4 KiB, owned, no symlinks/hardlinks), written atomically without
+overwriting existing evidence. All path components are descriptor-anchored.
+The runtime and attention directories must already be private or be created by
+the opted-in writer, never chmodded/repaired by the GUI. A new marker contains
+only its immutable binding, `waiting` and a random question identifier.
+This is the existing local same-UID trust model, not a sandbox against malicious
+processes running as the same user.
+
+QFileSystemWatcher observes the private directory tree, so atomic create/clear
+updates the tab without the six-second session poll. A three-second read-only
+revalidation repairs missed events and checks the same live process/server
+ticks, namespace and boot provenance. Exit/zombie/PID reuse, mismatched metadata,
+unsafe files or watcher loss make the observation unknown. Stale files are
+ignored, not automatically deleted. A recreated source gets a new epoch and
+fresh snapshot; old callbacks cannot restore yellow. No focus/tab switching or
+desktop alert was added. Nonactive attached tabs keep updating.
+
+The synthetic tests execute the actual Rust wrapper/helper with fixed Python
+fixture programs in place of Codex, private registries and an inert tmux socket.
+They cover three parallel runs, mark/clear, stale clear, restart, forgotten
+markers after exit, process generations, path/mode/schema/atomic-write guards,
+watcher recovery, all P0-A tests and both existing native backend suites.
+They do not execute Codex or create a real screen/tmux server. Tests may need
+permission outside a sandbox that forbids binding even a private inert socket.
+
+Real Codex 0.163.0 instruction adherence, environment forwarding and sandbox
+visibility/write access still require a separately approved new isolated CLI
+smoke test. If namespace or permission checks fail, attention stays unavailable;
+there is no bypass, adoption or restart fallback. No such real CLI test was run.

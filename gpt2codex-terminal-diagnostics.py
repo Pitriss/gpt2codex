@@ -22,6 +22,129 @@ import threading
 REPO = Path(__file__).resolve().parent
 MARKER = "gpt2codex-synthetic-terminal-v1\n"
 
+# GNU screen 4.9.1 display.c from the official release tarball. No download,
+# installation, screen server or unreviewed source compilation in --mouse-test.
+SCREEN_DISPLAY_SHA256 = 'c71906981ae6b3f17021a8701d24a006b717d0582b31ea91b8a1ced1c7839d63'
+MOUSE_HARNESS_PREFIX = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#define MAX_MOUSE_SEQUENCE (3+10+1+10+1+10+1)
+enum { CSI_PB=0, CSI_PX=1, CSI_PY=2, CSI_DONE=3,
+       CSI_ESC_SEEN, CSI_BEGIN, CSI_INACTIVE, CSI_INVALID };
+struct { int state, sgrmode, params[8]; } D_mouse_parse;
+int D_mouse, D_mousetrack=0; void *display;
+struct layer { int l_mode, l_width, l_height; } layer={0,2000,2000};
+struct canvas { int c_xs,c_xe,c_ys,c_ye,c_xoff,c_yoff; struct layer *c_layer; }
+    canvas={0,1999,0,1999,0,0,&layer};
+struct canvas *D_forecv=&canvas;
+struct { int w_mouse; } window;
+#define D_fore (&window)
+unsigned char emitted[4096]; int emitted_n;
+static void disp_processinput(void *d,const void *b,int n) {
+    assert(n>=0 && emitted_n+n<(int)sizeof emitted);
+    memcpy(emitted+emitted_n,b,n); emitted_n+=n;
+}
+static struct canvas *FindCanvas(int x,int y) { return &canvas; }
+static void SetForeCanvas(void *d,struct canvas *c) {}
+static void replay_chunk(unsigned char *buf,int size) {
+'''
+MOUSE_HARNESS_SUFFIX = r'''
+}
+static void reset(int mode) {
+    memset(&D_mouse_parse,0,sizeof D_mouse_parse);
+    D_mouse_parse.state=CSI_INACTIVE;
+    D_mouse=window.w_mouse=mode; emitted_n=0;
+}
+static void fragment(const char *seq,int offset,int size) {
+    unsigned char buffer[4096];
+    assert(size+64<(int)sizeof buffer);
+    memcpy(buffer+64,seq+offset,size); replay_chunk(buffer+64,size);
+}
+static void identical(const char *seq,int n) {
+    assert(emitted_n==n && memcmp(emitted,seq,n)==0);
+}
+int main(void) {
+    const char *seqs[]={
+        "\033[<35;10;10M", "\033[<0;900;40M", "\033[<0;900;40m",
+        "\033[<32;20;11M", "\033[<35;10;10M\033[<35;11;10M",
+        "\033[A", "\033[200~fixture\033[201~",
+        "x\033[<35;1700;1500My", "\033[M#++"
+    };
+    int modes[]={0,1000,1002,1003}, cases=0;
+    for(int m=0;m<4;m++) for(int j=0;j<9;j++) {
+        int n=strlen(seqs[j]);
+        for(int chunk=1;chunk<=n;chunk++) {
+            reset(modes[m]);
+            for(int offset=0;offset<n;offset+=chunk)
+                fragment(seqs[j],offset,n-offset<chunk?n-offset:chunk);
+            identical(seqs[j],n); cases++;
+        }
+        for(int cut=1;cut<n;cut++) {
+            reset(modes[m]);
+            fragment(seqs[j],0,cut); fragment(seqs[j],cut,n-cut);
+            identical(seqs[j],n); cases++;
+        }
+    }
+    printf("SCREEN_MOUSE_FRAGMENT_CASES=%d\n",cases);
+    return 0;
+}
+'''
+
+
+def mouse_fragment_tests(source):
+    """Replay pinned upstream input parser; this is NOT a native GUI/TUI proof."""
+    if Path.cwd().resolve() != REPO or not (REPO / '.tmp').is_dir() or not (REPO / '.log').is_dir():
+        raise RuntimeError('run from ready repository root')
+    os.umask(0o077)
+    work = Path(tempfile.mkdtemp(prefix='mouse-fragments-', dir=REPO / '.tmp'))
+    logs = Path(tempfile.mkdtemp(prefix='mouse-fragments-', dir=REPO / '.log'))
+    result = {'status': 'FAIL', 'test': 'pinned_screen_input_parser',
+              'interest_modes': [0, 1000, 1002, 1003], 'sgr_encoding_mode': 1006,
+              'alternate_screen_1049_tested': False, 'native_backends_tested': False,
+              'actual_konsole_bug_reproduced': False, 'screen_servers_started': 0,
+              'codex_started': 0, 'live_sessions_accessed': 0}
+    try:
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as file:
+            metadata = os.fstat(file.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+                raise ValueError('UNSAFE_SCREEN_SOURCE')
+            data = file.read(1024 * 1024 + 1)
+        if hashlib.sha256(data).hexdigest() != SCREEN_DISPLAY_SHA256:
+            raise ValueError('UNREVIEWED_SCREEN_SOURCE')
+        text = data.decode('utf-8')
+        begin = text.index('  if (D_mouse && D_forecv)', text.index('#define MAX_MOUSE_SEQUENCE'))
+        end = text.index('\nstatic void\ndisp_processinput', begin)
+        block = text[begin:end].rstrip()
+        assert block.endswith('}')
+        harness = work / 'mouse.c'
+        harness.write_text(MOUSE_HARNESS_PREFIX + block[:-1] + MOUSE_HARNESS_SUFFIX)
+        compiler = shutil.which('cc')
+        if not compiler:
+            result.update(status='NOT RUN', category='C_COMPILER_UNAVAILABLE')
+            return 2
+        env = {**os.environ, 'TMPDIR': str(work)}
+        with (logs / 'compile.log').open('w') as log:
+            build = subprocess.run([compiler, '-std=gnu99', '-O0', str(harness), '-o', str(work / 'mouse')],
+                                   env=env, stdout=log, stderr=subprocess.STDOUT, timeout=30)
+        if build.returncode:
+            raise RuntimeError('MOUSE_HARNESS_BUILD_FAILED')
+        run = subprocess.run([str(work / 'mouse')], env=env, capture_output=True, timeout=10)
+        match = re.fullmatch(rb'SCREEN_MOUSE_FRAGMENT_CASES=([0-9]+)\n', run.stdout)
+        if run.returncode or not match or run.stderr:
+            raise RuntimeError('MOUSE_FRAGMENT_REPLAY_FAILED')
+        result.update(status='PASS', cases=int(match[1]), source_sha256=SCREEN_DISPLAY_SHA256)
+        return 0
+    except (OSError, ValueError, AssertionError, RuntimeError, subprocess.SubprocessError) as error:
+        # Category only; never emit arbitrary input files or terminal data.
+        result['failure_type'] = type(error).__name__
+        return 1
+    finally:
+        (logs / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
+        print('MOUSE_FRAGMENTS=' + result['status'] + ' report=' + str(logs / 'summary.json'))
+
 
 def terminal_metadata():
     result = {}
@@ -281,8 +404,16 @@ if __name__ == "__main__":
     parser.add_argument("--attach-fixture", nargs=2, metavar=("ROOT", "FULL_ID"))
     parser.add_argument("--visual", action="store_true", help="show only synthetic fixture windows")
     parser.add_argument("--self-test", action="store_true", help="test privacy and fixture guards; no screen start")
+    parser.add_argument('--mouse-test', action='store_true', help='pinned parser fragmentation tests; no server or GUI')
+    parser.add_argument('--screen-source', type=Path, help='reviewed GNU screen 4.9.1 display.c for --mouse-test')
     options = parser.parse_args()
-    if options.self_test:
+    if options.mouse_test:
+        if not options.screen_source or options.visual or options.frame or options.attach_fixture or options.self_test:
+            parser.error('--mouse-test requires only --screen-source PATH')
+        sys.exit(mouse_fragment_tests(options.screen_source))
+    elif options.screen_source:
+        parser.error('--screen-source requires --mouse-test')
+    elif options.self_test:
         safety_tests()
     elif options.frame:
         frame(options.frame)

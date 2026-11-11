@@ -4,8 +4,14 @@
 #include "backend_interface.h"
 #include "terminal_theme.h"
 #include "paste_shortcut_filter.h"
+#include "attention_source.h"
+#include "marker_attention_source.h"
 
 #include <QAction>
+#include <QDialog>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
@@ -17,6 +23,7 @@
 #include <QMimeData>
 #include <QDir>
 #include <QEvent>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QFontDatabase>
@@ -52,6 +59,7 @@
 #include <QGroupBox>
 #include <QListWidget>
 #include <QStackedWidget>
+#include <QSplitter>
 #include <QHBoxLayout>
 #include <QFont>
 #include <QFrame>
@@ -78,19 +86,89 @@ using namespace g2ctheme;
 struct Options {
     QString bridgeCli;
     QString config;
+    QString queueHelper;
+    QString queueConfig;
+    bool queueOnly = false;
     bool selfTest = false;
     bool themeProbe = false;
     bool settingsProbe = false;
     bool backendProbe = false;
 };
 
+// Prefer the installed sibling CLI; development builds also carry their source
+// location. PATH is used only when an executable was actually found there.
+QString localHelper(const QString &name) {
+    const QString app = QCoreApplication::applicationDirPath();
+    const QStringList roots{app, app + "/../../", app + "/../lib/gpt2codex",
+        app + "/../share/gpt2codex", QString::fromUtf8(G2C_GUI_SOURCE_ROOT)};
+    for (const auto &root : roots) {
+        QFileInfo file(QDir(root).filePath(name));
+        if (file.isFile()) { return file.canonicalFilePath(); }
+    }
+    return {};
+}
+
+// Same XDG/HOME rule as the CLI. Resolve once and pass this exact config to
+// discovery, settings and attach, so the displayed diagnostic is reproducible.
+QString defaultBridgeConfig() {
+    const QString xdg = qEnvironmentVariable("XDG_CONFIG_HOME");
+    return QDir(QFileInfo(xdg).isAbsolute() ? xdg : QDir::homePath() + "/.config")
+        .filePath("chatgpt2codex/config.toml");
+}
+
+QString defaultQueueConfig() {
+    // Same default as gpt2codex-github-queue.py, deliberately independent of XDG.
+    return QDir::homePath() + "/.config/gpt2codex/github-queue/config.json";
+}
+
+bool queueAllowedProjects(const QString &path, QSet<QString> &ids, QString &error) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 1024 * 1024) {
+        error = QStringLiteral("GitHub Queue allowlist nelze načíst: %1").arg(path);
+        return false;
+    }
+    const auto doc = QJsonDocument::fromJson(file.readAll());
+    const auto roots = doc.object().value("project_roots");
+    if (!doc.isObject() || doc.object().value("version").toInt(-1) != 1
+        || !roots.isObject() || roots.toObject().isEmpty()) {
+        error = QStringLiteral("GitHub Queue konfigurace nemá platný project_roots: %1").arg(path);
+        return false;
+    }
+    QSet<QString> fresh;
+    const auto object = roots.toObject();
+    for (auto it = object.begin(); it != object.end(); ++it) {
+        if (!QRegularExpression("^[a-zA-Z0-9_-]{1,64}$").match(it.key()).hasMatch()
+            || !it.value().isString() || !QFileInfo(it.value().toString()).isAbsolute()) {
+            error = QStringLiteral("GitHub Queue project_roots je neplatný: %1").arg(path);
+            return false;
+        }
+        fresh.insert(it.key());
+    }
+    ids = fresh;
+    return true;
+}
+
 bool parseOptions(const QStringList &arguments, Options &options, QString &error) {
     options.bridgeCli = QCoreApplication::applicationDirPath() + QStringLiteral("/gpt2codex");
+    if (!QFileInfo(options.bridgeCli).isExecutable()) {
+        options.bridgeCli = QStandardPaths::findExecutable(QStringLiteral("gpt2codex"));
+        if (options.bridgeCli.isEmpty()) {
+            for (const QString &build : {QStringLiteral("release"), QStringLiteral("debug")}) {
+                const QString candidate = QString::fromUtf8(G2C_GUI_SOURCE_ROOT)
+                    + QStringLiteral("/target/") + build + QStringLiteral("/gpt2codex");
+                if (QFileInfo(candidate).isFile() && QFileInfo(candidate).isExecutable()) {
+                    options.bridgeCli = candidate; break;
+                }
+            }
+        }
+    }
     bool sawBridgeCli = false;
     bool sawConfig = false;
     for (int i = 1; i < arguments.size(); ++i) {
         const QString arg = arguments.at(i);
-        if (arg == QStringLiteral("--self-test") && !options.selfTest && !options.themeProbe && !options.settingsProbe && !options.backendProbe) {
+        if (arg == QStringLiteral("--queue-only") && !options.queueOnly) {
+            options.queueOnly = true;
+        } else if (arg == QStringLiteral("--self-test") && !options.selfTest && !options.themeProbe && !options.settingsProbe && !options.backendProbe) {
             options.selfTest = true;
         } else if (arg == QStringLiteral("--theme-probe") && !options.themeProbe && !options.selfTest && !options.settingsProbe && !options.backendProbe) {
             options.themeProbe = true;
@@ -101,6 +179,10 @@ bool parseOptions(const QStringList &arguments, Options &options, QString &error
         } else if (arg == QStringLiteral("--bridge-cli") && !sawBridgeCli && i + 1 < arguments.size()) {
             options.bridgeCli = arguments.at(++i);
             sawBridgeCli = true;
+        } else if (arg == QStringLiteral("--queue-helper") && options.queueHelper.isEmpty() && i + 1 < arguments.size()) {
+            options.queueHelper = arguments.at(++i);
+        } else if (arg == QStringLiteral("--queue-config") && options.queueConfig.isEmpty() && i + 1 < arguments.size()) {
+            options.queueConfig = arguments.at(++i);
         } else if (arg == QStringLiteral("--config") && !sawConfig && i + 1 < arguments.size()) {
             options.config = arguments.at(++i);
             sawConfig = true;
@@ -110,7 +192,7 @@ bool parseOptions(const QStringList &arguments, Options &options, QString &error
         }
     }
     const QFileInfo cli(options.bridgeCli);
-    if (!cli.isAbsolute() || !cli.isFile() || !cli.isExecutable()) {
+    if ((!cli.isAbsolute() || !cli.isFile() || !cli.isExecutable()) && (!options.queueOnly || sawBridgeCli)) {
         error = QStringLiteral("Bridge CLI musí být existující spustitelný absolutní soubor: %1").arg(options.bridgeCli);
         return false;
     }
@@ -118,6 +200,23 @@ bool parseOptions(const QStringList &arguments, Options &options, QString &error
     if (!options.config.isEmpty() && !QFileInfo(options.config).isAbsolute()) {
         error = QStringLiteral("--config vyžaduje absolutní cestu");
         return false;
+    }
+    if (options.config.isEmpty()) { options.config = defaultBridgeConfig(); }
+    if (options.queueConfig.isEmpty()) { options.queueConfig = defaultQueueConfig(); }
+    if (!QFileInfo(options.queueConfig).isAbsolute()) {
+        error = QStringLiteral("--queue-config vyžaduje absolutní cestu");
+        return false;
+    }
+    if (options.queueHelper.isEmpty()) {
+        options.queueHelper = localHelper(QStringLiteral("gpt2codex_queue_screen.py"));
+    }
+    if (!options.queueHelper.isEmpty()) {
+        QFileInfo helper(options.queueHelper);
+        if (!helper.isAbsolute() || !helper.isFile()) {
+            error = QStringLiteral("--queue-helper vyžaduje existující absolutní soubor");
+            return false;
+        }
+        options.queueHelper = helper.canonicalFilePath();
     }
     return true;
 }
@@ -159,14 +258,14 @@ QString readBackendPreference() {
 // This keeps Qt6 GUI runnable with either backend installed (no hard link).
 class BackendRegistry final {
 public:
-    BackendRegistry() {
+    BackendRegistry() : BackendRegistry(nullptr) {}
+    explicit BackendRegistry(Gpt2CodexTerminalBackend *provider) {
+        if (provider) { providers_.insert(provider->id(), provider); return; }
         load(QString::fromLatin1(backendKonsole));
         load(QString::fromLatin1(backendQTerm));
     }
     // Also permits exercising presentation lifecycle with an in-memory backend.
-    explicit BackendRegistry(Gpt2CodexTerminalBackend &provider) {
-        providers_.insert(provider.id(), &provider);
-    }
+    explicit BackendRegistry(Gpt2CodexTerminalBackend &provider) : BackendRegistry(&provider) {}
 
     bool available(const QString &id) const {
         auto *provider = providers_.value(id, nullptr);
@@ -525,6 +624,10 @@ bool sameLiveSessionIdentity(const Session &previous, const Session &current) {
         && previous.sessionId == current.sessionId;
 }
 
+g2cattention::Identity attentionIdentity(const Session &session) {
+    return {session.id, session.multiplexer, session.sessionId, session.generation};
+}
+
 QStringList listArguments(const Options &options) {
     QStringList args{QStringLiteral("session"), QStringLiteral("list"), QStringLiteral("--program-status")};
     if (!options.config.isEmpty()) {
@@ -672,13 +775,18 @@ public:
         update(session);
         // The pinned Bridge is created before the first asynchronous listing.
         initialListing_ = session.id == QStringLiteral("bridge")
-            && session.state == QStringLiteral("not_registered");
+            && (session.state == QStringLiteral("not_registered") || session.state == QStringLiteral("unknown"));
         qApp->installEventFilter(this);
     }
 
     void setRefreshRequested(std::function<void()> callback) { refreshRequested_ = std::move(callback); }
     QString tabLabel(int limit) const { return displayName(session_, limit); }
     const Session &session() const { return session_; }
+    void setPresentationChanged(std::function<void()> callback) { presentationChanged_ = std::move(callback); }
+    bool attentionEnabled() const {
+        return terminal_ && session_.running() && !identityChanged_ && !intentionallyDetached_
+            && session_.programState != QStringLiteral("exited");
+    }
 
     bool containsTerminal(QWidget *widget) const {
         return terminal_ && widget && (widget == terminal_ || terminal_->isAncestorOf(widget));
@@ -775,8 +883,13 @@ public:
                 ? QStringLiteral("ukončen (exit %1, signál %2); bez automatického restartu").arg(session.exitCode, session.exitSignal)
                 : session.programState == QStringLiteral("running") ? QStringLiteral("běží") : QStringLiteral("nesledován / neověřen")));
         if (!session.running()) {
-            hint_->setText(QStringLiteral("Relace není dostupná. GUI nic automaticky nespouští. ")
-                + QStringLiteral("Zkontroluj ji pomocí gpt2codex session status --multiplexer %1.").arg(session.multiplexer));
+            const QString target = session.id == "bridge" ? QStringLiteral("--bridge") : "--id " + session.id;
+            hint_->setText((session.state == "not_registered"
+                ? QStringLiteral("Projekt je v konfiguraci; pro tento multiplexer chybí registrovaná relace. Jméno cizího screenu není registrace. ")
+                : QStringLiteral("Relace není ověřena jako dostupná. "))
+                + QStringLiteral("GUI nic nespouští ani nepřebírá. Ověření: %1 session status %2 --multiplexer %3 --config %4")
+                    .arg(options_.bridgeCli, target, session.multiplexer,
+                         options_.config.isEmpty() ? defaultBridgeConfig() : options_.config));
             hint_->show();
             reconnect_->hide();
         } else if (terminal_) {
@@ -796,6 +909,7 @@ public:
             reconnect_->show();
             reconnect_->setEnabled(true);
         }
+        if (presentationChanged_) { presentationChanged_(); }
     }
 
 protected:
@@ -810,6 +924,7 @@ protected:
                 if (screenPrefix_ && key->key() == Qt::Key_D
                     && (key->modifiers() == Qt::NoModifier || key->modifiers() == Qt::ControlModifier)) {
                     intentionallyDetached_ = true;
+                    if (presentationChanged_) { presentationChanged_(); }
                 }
                 screenPrefix_ = false;
             }
@@ -838,6 +953,7 @@ private Q_SLOTS:
         reconnect_->show();
         reconnect_->setEnabled(true);
         wantAttach_ = false; // No automatic repeat after unexpected termination.
+        if (presentationChanged_) { presentationChanged_(); }
     }
 
 private:
@@ -849,6 +965,7 @@ private:
         disconnect(old, nullptr, this, nullptr);
         layout()->removeWidget(old);
         delete old; // Kills only the transient screen-attach client PTY.
+        if (presentationChanged_) { presentationChanged_(); }
     }
 
     void attach() {
@@ -872,6 +989,7 @@ private:
         // Uniform signal contract is provided by each backend module.
         connect(term, SIGNAL(terminalFinished()), this, SLOT(onTerminalFinished()));
         provider->start(term);
+        if (presentationChanged_) { presentationChanged_(); }
         // The PTY and focus proxy can become ready after this widget is
         // inserted into its visible tab; avoid focusing hidden tabs.
         QTimer::singleShot(0, this, [this] { focusTerminal(); });
@@ -893,11 +1011,348 @@ private:
     bool identityChanged_ = false;
     QString expectedReattachSessionId_;
     std::function<void()> refreshRequested_;
+    std::function<void()> presentationChanged_;
 };
+
+struct QueueScreenRows {
+    QList<QJsonObject> rows;
+    QStringList warnings;
+};
+
+QueueScreenRows parseQueueScreenRows(const QJsonArray &values) {
+    QueueScreenRows result;
+    QHash<QString, int> counts;
+    for (const auto &value : values) {
+        const auto slot = value.toObject().value("slot").toString();
+        if (!slot.isEmpty()) { ++counts[slot]; }
+    }
+    int index = 0;
+    for (const auto &value : values) {
+        ++index;
+        auto row = value.toObject();
+        const auto slot = row.value("slot").toString();
+        auto warn = [&](const QString &reason) {
+            result.warnings.append(QStringLiteral("Záznam %1 (%2): %3").arg(index)
+                .arg(slot.isEmpty() ? QStringLiteral("bez slotu") : slot, reason));
+        };
+        if (!value.isObject()) { warn(QStringLiteral("není objekt; vynechán")); continue; }
+        if (counts.value(slot) > 1) {
+            warn(QStringLiteral("duplicitní identita slotu; všechny výskyty vynechány")); continue;
+        }
+        const auto match = QRegularExpression(QStringLiteral("^q([0-9]+)-[0-9a-f]{12}$")).match(slot);
+        const auto number = row.value("number");
+        // #0 can be historical metadata. It is never an attach target.
+        if (!match.hasMatch() || !number.isDouble() || number.toDouble() < 0
+            || number.toDouble() != number.toInt(-1)
+            || match.captured(1) != QString::number(number.toInt())) {
+            warn(QStringLiteral("neplatný slot/number nebo nesoulad identity; vynechán")); continue;
+        }
+        if (!QRegularExpression(QStringLiteral("^[a-zA-Z0-9_-]{1,64}$")).match(row.value("project").toString()).hasMatch()) {
+            warn(QStringLiteral("chybějící/neplatný project; vynechán")); continue;
+        }
+        bool invalid = false;
+        for (const auto &key : {QStringLiteral("phase"), QStringLiteral("thread_id"), QStringLiteral("attachable"), QStringLiteral("screen_alive")}) {
+            const auto field = row.value(key);
+            if (field.isUndefined() || (key == "thread_id" && field.isNull())) { continue; }
+            if (key == "attachable" || key == "screen_alive" ? !field.isBool() : !field.isString()) { invalid = true; }
+        }
+        if (invalid) { warn(QStringLiteral("neplatný typ optional metadat; vynechán")); continue; }
+        if (row.value("phase").toString().isEmpty()) {
+            row.insert("phase", "metadata_incomplete");
+            warn(QStringLiteral("chybí phase; pouze zobrazení"));
+        }
+        if (!row.contains("attachable")) { warn(QStringLiteral("chybí attachable; připojení zakázáno")); }
+        row.insert("key", slot);
+        result.rows.append(row);
+    }
+    return result;
+}
+
+bool activeQueueRow(const QJsonObject &row) {
+    const auto status = row.value("queue_status").toString();
+    return row.value("screen_alive").toBool() || row.value("attachable").toBool()
+        || status == "pending" || status == "approved" || status == "approved-screen"
+        || status == "running";
+}
+
+// Presentation only: all slot identity checks and the non-stealing attachment
+// remain in the existing Python helper. No prompt, approval or server control.
+class QueuePage final : public QWidget {
+    Q_OBJECT
+public:
+    QueuePage(const Options &options, BackendRegistry &backends, QWidget *parent = nullptr)
+        : QWidget(parent), options_(options), backends_(backends),
+          python_(QStandardPaths::findExecutable(QStringLiteral("python3"))) {
+        setObjectName(QStringLiteral("githubQueuePage"));
+        auto *outer = new QVBoxLayout(this);
+        auto *notice = new QLabel(QStringLiteral("Schválení probíhá dosavadním lokálním queue CLI. GUI úlohy neschvaluje ani nespouští. tui_starting vyžaduje vizuální ověření TUI."), this);
+        notice->setWordWrap(true);
+        outer->addWidget(notice);
+        auto *split = new QSplitter(Qt::Horizontal, this);
+        auto *left = new QWidget(split);
+        auto *leftLayout = new QVBoxLayout(left);
+        leftLayout->setContentsMargins(0, 0, 0, 0);
+        left->setMinimumWidth(260);
+        filter_ = new QComboBox(left);
+        filter_->setObjectName(QStringLiteral("queueTaskFilter"));
+        filter_->addItems({QStringLiteral("Aktivní"), QStringLiteral("Historie")});
+        leftLayout->addWidget(filter_);
+        connect(filter_, &QComboBox::currentIndexChanged, this, [this] { applyFilter(); });
+        list_ = new QListWidget(left);
+        list_->setObjectName(QStringLiteral("queueTaskList"));
+        list_->setWordWrap(true);
+        leftLayout->addWidget(list_, 1);
+        detail_ = new QLabel(left);
+        detail_->setObjectName(QStringLiteral("queueTaskDetail"));
+        detail_->setWordWrap(true);
+        detail_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        leftLayout->addWidget(detail_);
+        auto *buttons = new QHBoxLayout;
+        auto *refresh = new QPushButton(QStringLiteral("Obnovit"), left);
+        refresh->setObjectName(QStringLiteral("queueTaskRefresh"));
+        open_ = new QPushButton(QStringLiteral("Otevřít úlohu"), left);
+        open_->setObjectName(QStringLiteral("queueTaskOpen"));
+        buttons->addWidget(refresh); buttons->addWidget(open_);
+        leftLayout->addLayout(buttons);
+        right_ = new QWidget(split);
+        right_->setMinimumSize(340, 240);
+        auto *rightLayout = new QVBoxLayout(right_);
+        terminalStatus_ = new QLabel(QStringLiteral("Vyber úlohu a otevři její existující TUI."), right_);
+        terminalStatus_->setWordWrap(true);
+        rightLayout->addWidget(terminalStatus_);
+        detach_ = new QPushButton(QStringLiteral("Odpojit"), right_);
+        detach_->setObjectName(QStringLiteral("queueTaskDetach"));
+        detach_->setEnabled(false);
+        rightLayout->addWidget(detach_);
+        split->setChildrenCollapsible(false);
+        split->setStretchFactor(0, 0); split->setStretchFactor(1, 1);
+        split->setSizes({340, 740});
+        outer->addWidget(split, 1);
+        hint_ = new QLabel(this); hint_->setObjectName(QStringLiteral("queueTaskHint"));
+        hint_->setWordWrap(true); outer->addWidget(hint_);
+        connect(refresh, &QPushButton::clicked, this, &QueuePage::refresh);
+        connect(open_, &QPushButton::clicked, this, &QueuePage::openSelected);
+        connect(detach_, &QPushButton::clicked, this, &QueuePage::disconnectTerminal);
+        connect(list_, &QListWidget::currentItemChanged, this, [this] { updateDetail(); });
+        connect(list_, &QListWidget::itemDoubleClicked, this, [this] { openSelected(); });
+        // Use the same native backend clipboard path and shortcut filter as
+        // project tabs, also in --queue-only where the main menus are absent.
+        new PasteShortcutFilter(this, [this](QWidget *w) {
+            return isVisible() && containsTerminal(w);
+        }, [this] { pasteClipboardText(); });
+        timer_.setInterval(6000);
+        connect(&timer_, &QTimer::timeout, this, &QueuePage::refresh);
+        timer_.start();
+        updateDetail();
+        QTimer::singleShot(0, this, &QueuePage::refresh);
+    }
+    ~QueuePage() override {
+        // Only metadata subprocesses belong to this page. The backend owns its
+        // transient screen -r client; no screen server is signalled here.
+        for (auto *proc : findChildren<QProcess *>(QStringLiteral("queueMetadataQuery"))) {
+            disconnect(proc, nullptr, this, nullptr);
+            if (proc->state() != QProcess::NotRunning) { proc->kill(); proc->waitForFinished(1000); }
+        }
+    }
+    bool containsTerminal(QWidget *widget) const {
+        return terminal_ && widget && (widget == terminal_ || terminal_->isAncestorOf(widget));
+    }
+    void focusTerminal() {
+        if (!isVisible() || !terminal_) { return; }
+        QWidget *target = terminal_;
+        for (auto *child : terminal_->findChildren<QWidget *>()) {
+            if (QString::fromLatin1(child->metaObject()->className()).endsWith("TerminalDisplay")) {
+                target = child; break;
+            }
+        }
+        target->setFocus(Qt::OtherFocusReason);
+    }
+    bool pasteClipboardText() {
+        bool accepted = false;
+        return terminal_ && QMetaObject::invokeMethod(terminal_, "pasteClipboardText",
+            Qt::DirectConnection, Q_RETURN_ARG(bool, accepted)) && accepted;
+    }
+    void disconnectTerminal() {
+        if (!terminal_) { return; }
+        auto *old = terminal_.data(); terminal_ = nullptr;
+        disconnect(old, nullptr, this, nullptr);
+        delete old; // Existing terminal backend destroys only its client PTY.
+        terminalStatus_->setText(QStringLiteral("Odpojeno: %1. Screen a Codex mohou dál běžet.").arg(attachedSlot_));
+        attachedSlot_.clear(); detach_->setEnabled(false); updateDetail();
+    }
+    void refresh() {
+        if (busy_) { return; }
+        if (options_.queueHelper.isEmpty() || python_.isEmpty()) {
+            fresh_ = false; updateDetail();
+            hint_->setText(QStringLiteral("Queue helper nebo python3 není dostupný. Použij --queue-helper /absolutní/cesta/gpt2codex_queue_screen.py. Projekty zůstávají dostupné."));
+            return;
+        }
+        busy_ = true;
+        query(options_.queueHelper, [this](bool ok, const QByteArray &raw) {
+            const auto doc = QJsonDocument::fromJson(raw);
+            if (!ok || !doc.isArray()) {
+                busy_ = false; fresh_ = false; updateDetail();
+                hint_->setText(QStringLiteral("Screen metadata nejsou dostupná; seznam je ponechán, otevírání pozastaveno. Zkus Obnovit."));
+                return;
+            }
+            const auto parsedScreens = parseQueueScreenRows(doc.array());
+            auto rows = parsedScreens.rows;
+            screenWarnings_ = parsedScreens.warnings;
+            const QString cli = QFileInfo(options_.queueHelper).dir().filePath("gpt2codex-github-queue.py");
+            if (!QFileInfo(cli).isFile()) { finishRefresh(rows, false); return; }
+            query(cli, [this, rows](bool jobsOk, const QByteArray &jobsRaw) mutable {
+                // Existing local CLI list is metadata-only, before read_token.
+                // Parse only its explicit number/status/project/mode/digest format.
+                static const QRegularExpression line(QStringLiteral("^#([0-9]+)\\s+(\\S+)\\s+(\\S+)\\s+(read-only|workspace-write)\\s+([0-9a-f]{12}) (.*)$"));
+                const auto screenRows = rows;
+                bool parsed = jobsOk;
+                for (const auto &text : QString::fromUtf8(jobsRaw).split('\n', Qt::SkipEmptyParts)) {
+                    if (text == "No accepted queue requests") { continue; }
+                    const auto match = line.match(text);
+                    if (!match.hasMatch()) { parsed = false; break; }
+                    const int number = match.captured(1).toInt();
+                    bool found = false;
+                    for (auto &row : rows) {
+                        if (row.value("number").toInt() != number) { continue; }
+                        row.insert("title", match.captured(6));
+                        row.insert("queue_status", match.captured(2)); found = true;
+                    }
+                    if (!found) {
+                        rows.append(QJsonObject{{"key", QStringLiteral("issue:%1").arg(number)},
+                            {"number", number}, {"project", match.captured(3)}, {"title", match.captured(6)},
+                            {"queue_status", match.captured(2)}, {"attachable", false}});
+                    }
+                }
+                finishRefresh(parsed ? rows : screenRows, parsed);
+            });
+        });
+    }
+private Q_SLOTS:
+    void terminalFinished() {
+        if (sender() != terminal_) { return; }
+        auto *old = terminal_.data(); terminal_ = nullptr;
+        old->deleteLater(); attachedSlot_.clear(); detach_->setEnabled(false);
+        terminalStatus_->setText(QStringLiteral("Klientský terminál skončil. Ověř stav pomocí Obnovit; připojení jinde se nepřebírá."));
+        updateDetail();
+    }
+private:
+    void query(const QString &script, std::function<void(bool, const QByteArray &)> done) {
+        auto *proc = new QProcess(this);
+        proc->setObjectName(QStringLiteral("queueMetadataQuery"));
+        auto complete = std::make_shared<bool>(false);
+        auto callback = [proc, complete, done](bool ok) {
+            if (*complete) { return; } *complete = true;
+            const auto raw = proc->readAllStandardOutput();
+            done(ok && raw.size() <= 1024 * 1024, raw);
+            proc->deleteLater();
+        };
+        connect(proc, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+            [callback](int code, QProcess::ExitStatus status) { callback(code == 0 && status == QProcess::NormalExit); });
+        connect(proc, &QProcess::errorOccurred, this, [callback](QProcess::ProcessError) { callback(false); });
+        QTimer::singleShot(5000, proc, [proc] { if (proc->state() != QProcess::NotRunning) { proc->kill(); } });
+        proc->start(python_, {script, QStringLiteral("list")});
+    }
+    void finishRefresh(const QList<QJsonObject> &rows, bool jobsOk) {
+        // Reconcile by stable key without clearing the widget or its selection.
+        const QSignalBlocker block(list_);
+        QSet<QString> keep;
+        for (const auto &row : rows) {
+            const auto key = row.value("key").toString(); keep.insert(key);
+            QListWidgetItem *item = nullptr;
+            for (int i = 0; i < list_->count(); ++i) {
+                if (list_->item(i)->data(Qt::UserRole).toString() == key) { item = list_->item(i); break; }
+            }
+            if (!item) { item = new QListWidgetItem(list_); item->setData(Qt::UserRole, key); }
+            const auto title = row.value("title").toString(row.value("slot").toString());
+            const QString text = QStringLiteral("#%1 | %2 | %3\n%4")
+                .arg(row.value("number").toInt()).arg(row.value("project").toString(), title, QStringLiteral("Queue stav: %1 · TUI stav: %2 · attachable: %3")
+                    .arg(row.value("queue_status").toString("—"), row.value("phase").toString("—"),
+                         row.value("attachable").toBool() ? QStringLiteral("ano") : QStringLiteral("ne")));
+            if (item->text() != text) { item->setText(text); }
+            item->setData(Qt::UserRole + 1, row);
+        }
+        for (int i = list_->count() - 1; i >= 0; --i) {
+            if (!keep.contains(list_->item(i)->data(Qt::UserRole).toString())) { delete list_->takeItem(i); }
+        }
+        busy_ = false; fresh_ = true; applyFilter();
+        hint_->setText(jobsOk ? QStringLiteral("Lokální stav; bez GitHub pollingu. Pending = čeká na lokální schválení.")
+            : QStringLiteral("Lokální queue list není dostupný nebo má neznámý formát; pending úlohy nelze spolehlivě zobrazit. Screen úlohy jsou dostupné."));
+        if (!screenWarnings_.isEmpty()) {
+            hint_->setText(hint_->text() + '\n' + screenWarnings_.join('\n'));
+        }
+    }
+    void applyFilter() {
+        for (int i = 0; i < list_->count(); ++i) {
+            auto *item = list_->item(i);
+            item->setHidden(filter_->currentIndex() == 0
+                && !activeQueueRow(item->data(Qt::UserRole + 1).toJsonObject()));
+        }
+        updateDetail();
+    }
+    QJsonObject selected() const {
+        return list_->currentItem() && !list_->currentItem()->isHidden() ? list_->currentItem()->data(Qt::UserRole + 1).toJsonObject() : QJsonObject();
+    }
+    bool canOpen(const QJsonObject &row) const {
+        const QString phase = row.value("phase").toString();
+        return fresh_ && row.value("number").toInt() > 0 && row.value("attachable").toBool()
+            && (phase == "tui_starting" || phase == "tui_ready")
+            && !row.value("slot").toString().isEmpty();
+    }
+    void updateDetail() {
+        const auto row = selected();
+        open_->setEnabled(canOpen(row) && row.value("slot").toString() != attachedSlot_);
+        QString error = row.value("error_type").toString(QStringLiteral("—"));
+        if (row.value("exit_code").toInt() != 0) {
+            error += QStringLiteral(" (exec exit %1)").arg(row.value("exit_code").toInt());
+        }
+        detail_->setText(row.isEmpty() ? QStringLiteral("Vyber úlohu pro podrobnosti.")
+            : QStringLiteral("TUI stav: %1\nQueue stav: %2\nThread UUID: %3\nPřipojitelná: %4\nChyba: %5")
+                .arg(row.value("phase").toString(), row.value("queue_status").toString("—"),
+                    row.value("thread_id").toString("—"), canOpen(row) ? QStringLiteral("ano (ověří helper)") : QStringLiteral("ne"),
+                    error));
+    }
+    void openSelected() {
+        const auto row = selected();
+        if (!canOpen(row) || row.value("slot").toString() == attachedSlot_) { return; }
+        disconnectTerminal();
+        Gpt2CodexTerminalBackend *provider = nullptr;
+        auto *term = backends_.create(readBackendPreference(), right_, python_,
+            {options_.queueHelper, QStringLiteral("attach"), row.value("slot").toString()},
+            QFileInfo(options_.queueHelper).absolutePath(), provider);
+        if (!term || !provider) {
+            terminalStatus_->setText(QStringLiteral("Terminálový backend není dostupný. Ověř Nastavení.")); return;
+        }
+        terminal_ = term; attachedSlot_ = row.value("slot").toString();
+        static_cast<QVBoxLayout *>(right_->layout())->addWidget(term, 1);
+        connect(term, SIGNAL(terminalFinished()), this, SLOT(terminalFinished()));
+        terminalStatus_->setText(QStringLiteral("TUI: #%1 / %2. Odpojit ukončí pouze klientské připojení.").arg(row.value("number").toInt()).arg(attachedSlot_));
+        detach_->setEnabled(true); updateDetail();
+        provider->start(term);
+        QTimer::singleShot(0, this, [this] { focusTerminal(); });
+    }
+    Options options_;
+    BackendRegistry &backends_;
+    QString python_, attachedSlot_;
+    QStringList screenWarnings_;
+    QListWidget *list_;
+    QComboBox *filter_;
+    QLabel *detail_, *hint_, *terminalStatus_;
+    QPushButton *open_, *detach_;
+    QWidget *right_;
+    QPointer<QWidget> terminal_;
+    QTimer timer_;
+    bool busy_ = false, fresh_ = false;
+};
+
 
 class MainWindow final : public QMainWindow {
 public:
-    explicit MainWindow(Options options) : options_(std::move(options)) {
+    explicit MainWindow(Options options, Gpt2CodexTerminalBackend *testBackend = nullptr,
+                        g2cattention::AttentionSource *source = nullptr)
+        : options_(std::move(options)), backends_(testBackend),
+          markerAttention_(options_.queueOnly ? QString() : qEnvironmentVariable("XDG_RUNTIME_DIR")),
+          attentionSource_(source ? source : &markerAttention_) {
+        attentionClock_.start();
         setWindowTitle(QStringLiteral("gpt2codex – správce Codex relací"));
         resize(1100, 680);
         setMinimumSize(700, 420);
@@ -908,10 +1363,33 @@ public:
         tabs_->tabBar()->setExpanding(false);
         tabs_->tabBar()->setUsesScrollButtons(true);
         setCentralWidget(tabs_);
+        const QString stateBase = qEnvironmentVariable("XDG_STATE_HOME", QDir::homePath() + "/.local/state");
+        statusBar()->setToolTip(QStringLiteral("CLI: %1\nConfig: %2\nRegistry relací: %3/gpt2codex/screen-sessions\nGUI čte jen registrované identity; seznam fyzických socketů není seznam projektů.")
+            .arg(options_.bridgeCli, options_.config.isEmpty() ? defaultBridgeConfig() : options_.config, stateBase));
+        queuePage_ = new QueuePage(options_, backends_, tabs_);
+        if (options_.queueOnly) {
+            tabs_->addTab(queuePage_, QStringLiteral("GitHub Queue"));
+            tabs_->setTabsClosable(false);
+            auto *action = menuBar()->addAction(QStringLiteral("GitHub Queue úlohy…"));
+            connect(action, &QAction::triggered, this, [this] { showQueueTasks(); });
+            // Diagnostic mode never discovers or attaches project sessions.
+            return; // No Bridge discovery, polling, attention binding or automatic attach.
+        }
+        allowlistProblem_ = new QLabel(this);
+        allowlistProblem_->setObjectName(QStringLiteral("queueAllowlistProblem"));
+        allowlistProblem_->setTextFormat(Qt::PlainText);
+        allowlistProblem_->setWordWrap(true);
+        statusBar()->addPermanentWidget(allowlistProblem_, 1);
+        allowlistProblem_->hide();
+        attentionSource_->setBindingsChanged([window = QPointer<MainWindow>(this)] {
+            if (window) { window->updateTabPresentations(); }
+        });
         connect(tabs_, &QTabWidget::currentChanged, this, [this](int index) {
             if (pasteAction_) {
-                pasteAction_->setEnabled(qobject_cast<SessionPage *>(tabs_->widget(index)) != nullptr);
+                pasteAction_->setEnabled(tabs_->widget(index) == queuePage_
+                    || qobject_cast<SessionPage *>(tabs_->widget(index)) != nullptr);
             }
+            if (tabs_->widget(index) == queuePage_) { queuePage_->focusTerminal(); }
             auto *page = qobject_cast<SessionPage *>(tabs_->widget(index));
             if (page) {
                 QTimer::singleShot(0, page, [this, page] {
@@ -931,12 +1409,18 @@ public:
             const QString id = pages_.key(page);
             if (id.isEmpty()) { return; }
             hidden_.insert(id);
+            attentionSource_->unwatch(attention_.ticket(id));
+            attention_.remove(id);
             pages_.remove(id);
             tabs_->removeTab(index);
             page->deleteLater(); // Only disconnects the view; never kills a screen session.
             statusBar()->showMessage(QStringLiteral("Záložka odpojena; persistentní relace pokračuje."), 5000);
         });
         auto *tools = menuBar()->addMenu(QStringLiteral("Relace"));
+        if (!options_.queueHelper.isEmpty()) {
+            auto *queueAction = tools->addAction(QStringLiteral("GitHub Queue úlohy…"));
+            connect(queueAction, &QAction::triggered, this, [this] { showQueueTasks(); });
+        }
         auto *refreshAction = tools->addAction(QStringLiteral("Obnovit seznam"));
         connect(refreshAction, &QAction::triggered, this, [this] { refreshSessions(); });
         auto *restoreAction = tools->addAction(QStringLiteral("Zobrazit skryté záložky"));
@@ -950,7 +1434,7 @@ public:
         connect(detachAction, &QAction::triggered, this, [this] {
             if (auto *page = qobject_cast<SessionPage *>(tabs_->currentWidget())) {
                 page->disconnectTerminal();
-            }
+            } else if (tabs_->currentWidget() == queuePage_) { queuePage_->disconnectTerminal(); }
         });
 
         // Embedded KParts do not inherit a standalone Konsole main window's
@@ -963,7 +1447,8 @@ public:
         pasteAction_->setShortcutContext(Qt::WindowShortcut);
         new PasteShortcutFilter(this, [this](QWidget *target) {
             auto *page = qobject_cast<SessionPage *>(tabs_->currentWidget());
-            return page && page->containsTerminal(target);
+            return (page && page->containsTerminal(target))
+                || (tabs_->currentWidget() == queuePage_ && queuePage_->containsTerminal(target));
         }, [this] { pasteAction_->trigger(); });
         connect(pasteAction_, &QAction::triggered, this, [this] {
             const QMimeData *mime = QGuiApplication::clipboard()->mimeData(QClipboard::Clipboard);
@@ -972,7 +1457,9 @@ public:
                 return;
             }
             auto *page = qobject_cast<SessionPage *>(tabs_->currentWidget());
-            if (!page || !page->pasteClipboardText()) {
+            const bool pasted = page ? page->pasteClipboardText()
+                : tabs_->currentWidget() == queuePage_ && queuePage_->pasteClipboardText();
+            if (!pasted) {
                 statusBar()->showMessage(QStringLiteral("Terminál neumožnil vložení. Ověř backend a připojení relace."), 7000);
             }
         });
@@ -1008,16 +1495,38 @@ public:
             statusBar()->showMessage(QStringLiteral("System tray není dostupná; zavření GUI nezastaví screen."));
         }
         const Session bridge{QStringLiteral("bridge"), QStringLiteral("g2c-bridge"),
-            QStringLiteral("not_registered"), QStringLiteral("-"), QStringLiteral("Bridge")};
+            QStringLiteral("unknown"), QStringLiteral("-"), QStringLiteral("Bridge")};
         addPage(bridge);
         tabs_->tabBar()->setTabButton(0, QTabBar::LeftSide, nullptr);
         tabs_->tabBar()->setTabButton(0, QTabBar::RightSide, nullptr);
+        const int queueIndex = tabs_->addTab(queuePage_, QStringLiteral("GitHub Queue"));
+        tabs_->tabBar()->setTabButton(queueIndex, QTabBar::LeftSide, nullptr);
+        tabs_->tabBar()->setTabButton(queueIndex, QTabBar::RightSide, nullptr);
         tabs_->setCurrentIndex(0);
         refreshTimer_.setInterval(6000);
         connect(&refreshTimer_, &QTimer::timeout, this, [this] { refreshSessions(); });
         refreshTimer_.start();
         QTimer::singleShot(0, this, [this] { refreshSessions(); });
+        attentionTimer_.setInterval(1000);
+        connect(&attentionTimer_, &QTimer::timeout, this, [this] {
+            for (const QString &slot : attention_.expire(attentionClock_.elapsed())) {
+                if (auto *page = qobject_cast<SessionPage *>(pages_.value(slot))) { presentPage(page); }
+            }
+        });
+        attentionTimer_.start();
     }
+
+    void showQueueTasks() { tabs_->setCurrentWidget(queuePage_); }
+
+    ~MainWindow() override {
+        attentionSource_->setBindingsChanged({});
+        for (auto it = pages_.cbegin(); it != pages_.cend(); ++it) { attentionSource_->unwatch(attention_.ticket(it.key())); }
+    }
+
+#ifdef G2C_GUI_TEST
+    g2cattention::Ticket attentionTicket(const QString &slot) const { return attention_.ticket(slot); }
+    g2cattention::View attentionView(const QString &slot) const { return attention_.view(slot); }
+#endif
 
 protected:
     void changeEvent(QEvent *event) override {
@@ -1038,11 +1547,33 @@ protected:
     }
 
 private:
+    // These callbacks have presentation authority only. They cannot attach,
+    // detach, refresh session discovery, launch a program or answer approvals.
+    void presentPage(SessionPage *page) {
+        tabPresentation_.apply(tabs_, page, page->session().id, page->session().multiplexer,
+            page->tabLabel(maxTabLabelChars_), page->session().task, attention_.view(page->session().key()));
+    }
+
+    void syncAttention(SessionPage *page) {
+        const auto identity = attentionIdentity(page->session());
+        const auto previous = attention_.ticket(identity.slot());
+        const auto current = attention_.observe(identity, attentionSource_->binding(identity), page->attentionEnabled());
+        if (!(previous == current)) {
+            attentionSource_->unwatch(previous);
+            if (current.valid()) {
+                attentionSource_->watch(current, [window = QPointer<MainWindow>(this), guard = QPointer<SessionPage>(page)](const g2cattention::Event &event) {
+                    if (!window || !guard || window->pages_.value(event.ticket.identity.slot()) != guard) { return; }
+                    if (window->attention_.apply(event, window->attentionClock_.elapsed())) { window->presentPage(guard); }
+                });
+            }
+        }
+        presentPage(page);
+    }
+
     void updateTabPresentations() {
         for (auto it = pages_.cbegin(); it != pages_.cend(); ++it) {
             auto *page = static_cast<SessionPage *>(it.value());
-            tabPresentation_.apply(tabs_, page, page->session().id, page->session().multiplexer,
-                page->tabLabel(maxTabLabelChars_), page->session().task);
+            syncAttention(page);
         }
     }
 
@@ -1149,9 +1680,11 @@ private:
         auto *page = new SessionPage(options_, backends_, backendPreference_, session, tabs_);
         page->setRefreshRequested([this] { refreshSessions(); });
         pages_.insert(session.key(), page);
-        const int index = tabs_->addTab(page, displayName(session, maxTabLabelChars_));
-        tabPresentation_.apply(tabs_, page, session.id, session.multiplexer,
-            displayName(session, maxTabLabelChars_), session.task);
+        const int queueIndex = tabs_->indexOf(queuePage_);
+        const int index = tabs_->insertTab(queueIndex < 0 ? tabs_->count() : queueIndex,
+            page, displayName(session, maxTabLabelChars_));
+        page->setPresentationChanged([this, page] { syncAttention(page); });
+        syncAttention(page);
         if (session.id == QStringLiteral("bridge")) {
             tabs_->tabBar()->setTabButton(index, QTabBar::LeftSide, nullptr);
             tabs_->tabBar()->setTabButton(index, QTabBar::RightSide, nullptr);
@@ -1161,11 +1694,17 @@ private:
     void refreshSessions() {
         refreshProjectRoots();
         if (query_) { return; }
+        QSet<QString> allowed;
+        QString allowError;
+        const bool allowOk = queueAllowedProjects(options_.queueConfig.isEmpty()
+            ? defaultQueueConfig() : options_.queueConfig, allowed, allowError);
+        allowlistProblem_->setText(allowError);
+        allowlistProblem_->setVisible(!allowOk);
         auto *proc = new QProcess(this);
         query_ = proc;
         proc->setProcessChannelMode(QProcess::SeparateChannels);
         connect(proc, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
-            [this, proc](int code, QProcess::ExitStatus exitStatus) {
+            [this, proc, allowed, allowOk](int code, QProcess::ExitStatus exitStatus) {
                 if (query_ != proc) { return; }
                 query_ = nullptr;
                 const QByteArray data = proc->readAllStandardOutput();
@@ -1182,19 +1721,34 @@ private:
                     return;
                 }
                 int running = 0;
+                // Keep existing presentation on config failure. Never infer an empty allowlist.
+                if (allowOk) {
+                    for (auto *widget : pages_) {
+                        auto *page = static_cast<SessionPage *>(widget);
+                        const int index = tabs_->indexOf(page);
+                        if (index >= 0) { tabs_->setTabVisible(index,
+                            page->session().id == "bridge" || allowed.contains(page->session().id)); }
+                    }
+                }
+                QSet<QString> registered;
+                for (const auto &session : sessions) {
+                    if (session.state != "not_registered") { registered.insert(session.id); }
+                }
                 for (const Session &session : sessions) {
+                    const bool permitted = session.id == "bridge" || (allowOk && allowed.contains(session.id));
+                    if (!permitted && (allowOk || !pages_.contains(session.key()))) { continue; }
                     if (session.running()) { ++running; }
                     if (hidden_.contains(session.key())) { continue; }
                     if (!pages_.contains(session.key())) {
-                        if (session.state == QStringLiteral("not_registered")) { continue; }
+                        if (session.state == "not_registered"
+                            && (session.multiplexer != "screen" || registered.contains(session.id))) { continue; }
                         addPage(session);
                     } else {
                         auto *page = static_cast<SessionPage *>(pages_.value(session.key()));
                         page->update(session);
                         const int index = tabs_->indexOf(page);
                         if (index >= 0) {
-                            tabPresentation_.apply(tabs_, page, session.id, session.multiplexer,
-                                displayName(session, maxTabLabelChars_), session.task);
+                            syncAttention(page);
                         }
                     }
                 }
@@ -1209,7 +1763,8 @@ private:
                         if (selectedPlaceholder) { tabs_->setCurrentWidget(bridge); }
                     }
                 }
-                statusBar()->showMessage(QStringLiteral("Spravované relace: %1 běží · nové úkoly se nespouštějí").arg(running));
+                statusBar()->showMessage(QStringLiteral("Ověřené registrované relace: %1 dostupných · cizí screeny a Queue se nezapočítávají. CLI: %2 · config: %3")
+                    .arg(running).arg(options_.bridgeCli, options_.config.isEmpty() ? defaultBridgeConfig() : options_.config));
             });
         connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError) {
             if (query_ != proc) { return; }
@@ -1250,6 +1805,8 @@ private:
     QTabWidget *tabs_ = nullptr;
     QAction *pasteAction_ = nullptr;
     SettingsPage *settingsPage_ = nullptr;
+    QueuePage *queuePage_ = nullptr;
+    QLabel *allowlistProblem_ = nullptr;
     QHash<QString, QWidget *> pages_;
     QSet<QString> hidden_;
     QSystemTrayIcon *tray_ = nullptr;
@@ -1258,6 +1815,11 @@ private:
     QProcess *query_ = nullptr;
     QProcess *rootsQuery_ = nullptr;
     g2ctabs::Presentation tabPresentation_;
+    g2cattention::MarkerAttentionSource markerAttention_;
+    g2cattention::AttentionSource *attentionSource_;
+    g2cattention::Manager attention_;
+    QElapsedTimer attentionClock_;
+    QTimer attentionTimer_;
     bool exiting_ = false;
     bool trayAvailable_ = false;
 };
@@ -1366,7 +1928,7 @@ int main(int argc, char *argv[]) {
     QString error;
     if (!parseOptions(app.arguments(), options, error)) {
         std::fprintf(stderr, "gpt2codex-gui: %s\n", error.toUtf8().constData());
-        std::fprintf(stderr, "Použití: gpt2codex-gui [--bridge-cli /absolute/path/gpt2codex] [--config /absolute/config.toml] [--self-test] [--theme-probe] [--settings-probe] [--backend-probe]\n");
+        std::fprintf(stderr, "Použití: gpt2codex-gui [--bridge-cli /absolute/path/gpt2codex] [--config /absolute/config.toml] [--self-test] [--theme-probe] [--settings-probe] [--backend-probe] [--queue-helper /absolute/helper.py] [--queue-config /absolute/queue-config.json] [--queue-only]\n");
         return 2;
     }
     if (options.selfTest) { return selfTest(options); }

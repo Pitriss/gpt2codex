@@ -411,6 +411,25 @@ pub(crate) fn validate_task(value: &str) -> Result<()> {
 }
 
 pub fn start(config: &Path, target: Target<'_>, task: &str) -> Result<Status> {
+    start_with_attention(config, target, task, false)
+}
+
+pub fn start_with_attention(config: &Path, target: Target<'_>, task: &str, attention: bool) -> Result<Status> {
+    start_impl(config, target, task, attention, false)
+}
+
+/// Operator-approved, registered project screen with a non-Codex first window.
+/// No existing session is adopted and no Codex process is launched.
+pub fn start_anchor(config: &Path, target: Target<'_>, task: &str) -> Result<Status> {
+    if !matches!(target, Target::Project(_)) {
+        return Err(err("anchor-only start requires a project, not bridge"));
+    }
+    start_impl(config, target, task, false, true)
+}
+
+fn start_impl(config: &Path, target: Target<'_>, task: &str, attention: bool, anchor_only: bool) -> Result<Status> {
+    crate::project_supervisor::manual_project_start_gate(config, target)?;
+    let attention_args = if attention { Some(crate::attention_marker::launch_arguments(config, target, crate::multiplexer::Multiplexer::Screen)?) } else { None };
     validate_task(task)?;
     let registry = ProjectRegistry::load(config).map_err(|_| err("cannot load project registry"))?;
     let project_id = match target { Target::Bridge => "gpt2codex", Target::Project(id) => id };
@@ -426,7 +445,13 @@ pub fn start(config: &Path, target: Target<'_>, task: &str) -> Result<Status> {
         }
         Some(candidate)
     } else {
-        if !codex_available() { return Err(err("codex executable was not found in PATH")); }
+        if anchor_only {
+            if !executable(Path::new("/usr/bin/sleep")) {
+                return Err(err("anchor-only screen requires /usr/bin/sleep"));
+            }
+        } else if !codex_available() {
+            return Err(err("codex executable was not found in PATH"));
+        }
         None
     };
     probe_silent()?;
@@ -453,14 +478,23 @@ pub fn start(config: &Path, target: Target<'_>, task: &str) -> Result<Status> {
     };
     write_new_record(&record_file, &record)?;
     let mut command = Command::new("screen");
-    command.arg("-dmS").arg(&screen_name).arg("-t").arg(&screen_name)
+    command.arg("-dmS").arg(&screen_name).arg("-t")
+        .arg(if anchor_only { "g2c-anchor" } else { &screen_name })
         .current_dir(&root)
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     match target {
         Target::Bridge => {
             command.arg(shell.as_deref().expect("validated shell")).arg("-l");
         }
-        Target::Project(_) => { command.arg("codex"); }
+        Target::Project(_) => {
+            if anchor_only {
+                command.arg("/usr/bin/sleep").arg("infinity");
+            } else if let Some(args) = attention_args {
+                command.args(args);
+            } else {
+                command.arg("codex");
+            }
+        }
     }
     let rc = command.status().map_err(|_| err("GNU screen launch failed; inspect pending session record"))?;
     if !rc.success() { return Err(err("GNU screen exited with error; inspect pending session record")); }
