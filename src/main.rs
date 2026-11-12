@@ -22,9 +22,9 @@ fn usage() {
     eprintln!("S2 reservation candidate (runtime disabled):\n  supervisor inspect --id ID --config FILE --directory EXISTING_PRIVATE_DIR\n  supervisor claim --id ID --config FILE --directory EXISTING_PRIVATE_DIR --owner manual|queue --reservation-only [--issue-json JSON]\n  supervisor inspect-screen --id ID --config FILE --socket-directory EXISTING_PRIVATE_DIR\nClaims cannot launch processes or release unresolved reservations. Screen inspection is diagnostic only; window ownership is unverified. G2C_PROJECT_SUPERVISOR is an opt-in STOP gate, not an enable flag.");
     eprintln!("Opt-in question attention (local only):\n  session start --id ID --attention --approve-start [other start options]\n  attention run --id ID|--bridge --multiplexer screen|tmux --approve-run [--config FILE]\n  attention mark [--run RUN_NONCE]\n  attention clear --wait WAIT_NONCE [--run RUN_NONCE]\nNo native approval support; clear always requires the exact question nonce.");
     eprintln!("Tmux lifecycle:\n  session start --id ID --multiplexer tmux [--remain-on-exit] --approve-start [--program-status] [--config FILE]\n  session list|status [other options] --program-status\n  session archive --id ID --multiplexer tmux --expect-session-id FULL_ID --expect-process-start-ticks TICKS --approve-archive [--config FILE]\nArchive never authorizes a new start; legacy slots without namespace provenance are refused.");
-    eprintln!("Local multiplexer commands:\n  gpt2codex session probe|projects|list [--config FILE]\n  gpt2codex session prefer --id ID --multiplexer screen|tmux [--config FILE]\n  gpt2codex session status|attach --bridge|--id ID --multiplexer screen|tmux [--expect-session-id ID (attach only)] [--config FILE]\n  gpt2codex session start --bridge|--id ID [--multiplexer screen|tmux] [--task LABEL] --approve-start [--config FILE]");
+    eprintln!("Local multiplexer commands:\n  gpt2codex session probe|projects|list [--config FILE]\n  gpt2codex session prefer --id ID --multiplexer screen|tmux [--config FILE]\n  gpt2codex session status|attach --bridge|--id ID --multiplexer screen|tmux [--expect-session-id ID (attach only)] [--window N (screen attach only)] [--config FILE]\n  gpt2codex session start --bridge|--id ID [--multiplexer screen|tmux] [--task LABEL] --approve-start [--config FILE]");
     eprintln!(
-        "Usage:\n  gpt2codex screen probe [--config FILE]\n  gpt2codex screen list [--config FILE]\n  gpt2codex screen status|attach --bridge|--id PROJECT_ID [--config FILE]\n  gpt2codex screen start --bridge|--id PROJECT_ID [--task LABEL] [--anchor-only (project only)] --approve-start [--config FILE]\n  gpt2codex mcp stdio [--config /absolute/config.toml] [--allow-context-read]\n  gpt2codex codex probe\n  gpt2codex codex diagnostics --id PROJECT_ID [--limit 10] [--config FILE]\n  gpt2codex codex sessions --cwd /absolute/project/path [--limit 25] [--pages 1]\n  gpt2codex codex session --cwd /absolute/project/path --id UUID\n  gpt2codex workspace bootstrap --project-dir ABS --id ID --directory REPO_DIR --git-name NAME --git-email EMAIL [--codex-name NAME] [--config FILE]\n  gpt2codex workspace adopt --id PROJECT_ID --directory REPO_DIR [--dry-run] [--config FILE]\n  gpt2codex workspace health|ensure|sync-policy --id ID [--config FILE]\n  gpt2codex projects list [--config /absolute/config.toml]\n  gpt2codex project info|contexts|sessions|session|read|name --id PROJECT_ID [--config /absolute/config.toml]\n    project sessions: [--limit 25] [--pages 1]\n    project session: --thread UUID\n    project read: --scope global|project --file ALLOWLISTED_PATH\n    project name: --task SHORT_TASK\n\nP0 mode: read-only MCP; workspace writes and screen start/attach require explicit LOCAL CLI invocation, never exposed via MCP."
+        "Usage:\n  gpt2codex screen probe [--config FILE]\n  gpt2codex screen list [--config FILE]\n  gpt2codex screen status|attach --bridge|--id PROJECT_ID [--config FILE]\n  gpt2codex screen start --bridge|--id PROJECT_ID [--task LABEL] [--anchor-only (project only)] --approve-start [--config FILE]\n  gpt2codex mcp stdio [--config /absolute/config.toml] [--allow-context-read]\n  gpt2codex codex probe\n  gpt2codex codex diagnostics --id PROJECT_ID [--limit 10] [--config FILE]\n  gpt2codex codex sessions --cwd /absolute/project/path [--limit 25] [--pages 1]\n  gpt2codex codex session --cwd /absolute/project/path --id UUID\n  gpt2codex workspace bootstrap --project-dir ABS --id ID --directory REPO_DIR --git-name NAME --git-email EMAIL [--codex-name NAME] [--config FILE]\n  gpt2codex workspace adopt --id PROJECT_ID --directory REPO_DIR [--type standard|non-git] [--dry-run] [--config FILE]\n  gpt2codex workspace upgrade --id ID --to standard [--dry-run] [--config FILE]\n  gpt2codex workspace health|ensure|sync-policy --id ID [--config FILE]\n  gpt2codex projects list [--config /absolute/config.toml]\n  gpt2codex project metadata|info|contexts|sessions|session|read|name --id PROJECT_ID [--config /absolute/config.toml]\n    project sessions: [--limit 25] [--pages 1]\n    project session: --thread UUID\n    project read: --scope global|project --file ALLOWLISTED_PATH\n    project name: --task SHORT_TASK\n\nP0 mode: read-only MCP; workspace writes and screen start/attach require explicit LOCAL CLI invocation, never exposed via MCP."
     );
 }
 
@@ -195,7 +195,10 @@ fn run_registry(command: &str, args: impl Iterator<Item = String>) -> Result<(),
         Some(path) => path,
         None => default_config_path()?,
     };
-    let registry = ProjectRegistry::load(&config)?;
+    let registry = match options.id.as_deref() {
+        Some(id) => ProjectRegistry::load_for(&config, id)?,
+        None => ProjectRegistry::load(&config)?,
+    };
     if command == "list" {
         println!("project_dir={}", registry.project_dir.display());
         for project in registry.projects() {
@@ -206,8 +209,12 @@ fn run_registry(command: &str, args: impl Iterator<Item = String>) -> Result<(),
     let id = options.id.as_deref().ok_or("--id required")?;
     let project = registry.project(id)?;
     match command {
+        "metadata" => {
+            println!("{}", serde_json::json!({"id": project.id, "root": project.root, "type": project.project_type.as_str()}));
+        }
         "info" => {
             println!("id={}", project.id);
+            println!("type={}", project.project_type.as_str());
             println!("name={}", project.name);
             println!("root={}", project.root.display());
             println!("codex_name={}", project.codex_name);
@@ -262,18 +269,22 @@ struct WorkspaceOptions {
     git_email: Option<String>,
     codex_name: Option<String>,
     dry_run: bool,
+    project_type: Option<String>,
+    to: Option<String>,
 }
 
 fn parse_workspace_options(args: impl Iterator<Item = String>, action: &str) -> Result<WorkspaceOptions, &'static str> {
     let mut opts = WorkspaceOptions::default();
     let mut args = args;
     while let Some(flag) = args.next() {
-        if flag == "--dry-run" && action == "adopt" && !opts.dry_run {
+        if flag == "--dry-run" && matches!(action, "adopt" | "upgrade") && !opts.dry_run {
             opts.dry_run = true;
             continue;
         }
         let value = args.next().ok_or("missing workspace option value")?;
         match flag.as_str() {
+            "--type" if action == "adopt" && opts.project_type.is_none() => { chatgpt2codex::registry::ProjectType::parse(&value).map_err(|_| "unknown project type")?; opts.project_type = Some(value); },
+            "--to" if action == "upgrade" && opts.to.is_none() && value == "standard" => opts.to = Some(value),
             "--config" if opts.config.is_none() => opts.config = Some(PathBuf::from(value)),
             "--id" if opts.id.is_none() => opts.id = Some(value),
             "--project-dir" if action == "bootstrap" && opts.project_dir.is_none() => opts.project_dir = Some(PathBuf::from(value)),
@@ -289,6 +300,7 @@ fn parse_workspace_options(args: impl Iterator<Item = String>, action: &str) -> 
         || opts.git_name.is_none() || opts.git_email.is_none()) {
         return Err("bootstrap requires --project-dir, --directory, --git-name and --git-email");
     }
+    if action == "upgrade" && opts.to.is_none() { return Err("upgrade requires --to standard"); }
     if action == "adopt" && opts.directory.is_none() { return Err("adopt requires --directory"); }
     Ok(opts)
 }
@@ -313,6 +325,7 @@ fn run_workspace(action: &str, args: impl Iterator<Item = String>) -> Result<(),
         }
         "adopt" => {
             let request = workspace::AdoptRequest {
+                project_type: chatgpt2codex::registry::ProjectType::parse(opts.project_type.as_deref().unwrap_or("standard"))?,
                 config_path: config.clone(),
                 id: id.clone(),
                 directory: opts.directory.ok_or("--directory required")?,
@@ -322,6 +335,11 @@ fn run_workspace(action: &str, args: impl Iterator<Item = String>) -> Result<(),
             println!("existing_agents={} existing_context={} already_registered={} git_identity_policy=preserve",
                 report.had_agents, report.had_context, report.already_registered);
             if report.had_agents || report.had_context { println!("context_review=required"); }
+            if opts.dry_run { return Ok(()); }
+        }
+        "upgrade" => {
+            workspace::upgrade(&config, &id, opts.dry_run)?;
+            println!("workspace_upgrade={} project_id={id}", if opts.dry_run { "dry_run_ok" } else { "ok" });
             if opts.dry_run { return Ok(()); }
         }
         "ensure" => {
@@ -440,6 +458,7 @@ struct MultiplexerOptions {
     task: Option<String>,
     expected: Option<String>,
     expected_ticks: Option<u64>,
+    window: Option<u32>,
     approved: bool,
     remain_on_exit: bool,
     approve_archive: bool,
@@ -461,6 +480,11 @@ fn parse_multiplexer_options(action: &str, mut args: impl Iterator<Item = String
             "--task" if action == "start" && opts.task.is_none() => opts.task = Some(args.next().ok_or("missing task")?),
             "--expect-session-id" if matches!(action, "attach" | "archive") && opts.expected.is_none() => opts.expected = Some(args.next().ok_or("missing expected identity")?),
             "--expect-process-start-ticks" if matches!(action, "attach" | "archive") && opts.expected_ticks.is_none() => opts.expected_ticks = Some(args.next().ok_or("missing process generation")?.parse().map_err(|_| "invalid process generation")?),
+            "--window" if action == "attach" && opts.window.is_none() => {
+                let value: u32 = args.next().ok_or("missing screen window number")?.parse().map_err(|_| "invalid screen window number")?;
+                if value > 99 { return Err("screen window number out of range"); }
+                opts.window = Some(value);
+            }
             "--approve-start" if action == "start" && !opts.approved => opts.approved = true,
             "--remain-on-exit" if action == "start" && !opts.remain_on_exit => opts.remain_on_exit = true,
             "--attention" if action == "start" && !opts.attention => opts.attention = true,
@@ -476,6 +500,7 @@ fn parse_multiplexer_options(action: &str, mut args: impl Iterator<Item = String
         return Err("actual multiplexer required; attachment never follows project preference");
     }
     if action == "start" && !opts.approved { return Err("session start requires --approve-start"); }
+    if opts.window.is_some() && opts.mux != Some(Multiplexer::Screen) { return Err("--window requires --multiplexer screen"); }
     if opts.attention && opts.bridge { return Err("Bridge start remains a shell; --attention requires --id"); }
     if action == "archive" && (!opts.approve_archive || opts.mux != Some(Multiplexer::Tmux) || opts.expected.is_none() || opts.expected_ticks.is_none()) {
         return Err("archive requires tmux, --approve-archive and exact expected session ID/start ticks");
@@ -491,11 +516,13 @@ fn print_managed_status(item: session::ManagedStatus, include_program: bool) {
         return;
     }
     let program = item.program;
-    println!("multiplexer={} generation={} project_id={} screen_name={} state={} session_id={} program={} exit_code={} exit_signal={} exited_at={} task={}",
+    println!("multiplexer={} generation={} project_id={} screen_name={} state={} session_id={} program={} exit_code={} exit_signal={} exited_at={} window={} window_title={} task={}",
         item.multiplexer.as_str(), info.process_start_ticks.map(|n| n.to_string()).as_deref().unwrap_or("-"),
         info.project_id, info.screen_name, info.state, info.full_id.as_deref().unwrap_or("-"), program.state,
         program.exit_code.map(|n| n.to_string()).as_deref().unwrap_or("-"), program.signal.as_deref().unwrap_or("-"),
-        program.exited_at.map(|n| n.to_string()).as_deref().unwrap_or("-"), info.task.as_deref().unwrap_or("-"));
+        program.exited_at.map(|n| n.to_string()).as_deref().unwrap_or("-"),
+        program.window_number.map(|n| n.to_string()).as_deref().unwrap_or("-"),
+        program.window_title.as_deref().unwrap_or("-"), info.task.as_deref().unwrap_or("-"));
 }
 
 fn run_session(action: &str, args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -533,7 +560,7 @@ fn run_session(action: &str, args: impl Iterator<Item = String>) -> Result<(), B
             }
             print_managed_status(session::details(&config, mux, target)?, opts.program_status);
         }
-        "attach" => session::attach(&config, mux, target, opts.expected.as_deref(), opts.expected_ticks)?,
+        "attach" => session::attach(&config, mux, target, opts.expected.as_deref(), opts.expected_ticks, opts.window)?,
         "archive" => {
             let archived = chatgpt2codex::tmux_archive::archive(&config, opts.id.as_deref().ok_or("project required")?,
                 opts.expected.as_deref().ok_or("expected identity required")?, opts.expected_ticks.ok_or("expected generation required")?)?;
@@ -611,7 +638,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if group == "workspace" {
         let subcommand = args.next().ok_or("missing workspace subcommand")?;
-        if !matches!(subcommand.as_str(), "bootstrap" | "adopt" | "ensure" | "health" | "sync-policy") {
+        if !matches!(subcommand.as_str(), "bootstrap" | "adopt" | "upgrade" | "ensure" | "health" | "sync-policy") {
             return Err("unknown workspace subcommand".into());
         }
         return run_workspace(&subcommand, args);
@@ -624,7 +651,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if group == "project" {
         let subcommand = args.next().ok_or("missing project subcommand")?;
-        if !matches!(subcommand.as_str(), "info" | "contexts" | "read" | "name" | "sessions" | "session") {
+        if !matches!(subcommand.as_str(), "metadata" | "info" | "contexts" | "read" | "name" | "sessions" | "session") {
             return Err("unknown project subcommand".into());
         }
         return run_registry(&subcommand, args);
@@ -722,6 +749,18 @@ mod tests {
     }
 
     #[test]
+    fn workspace_types_and_one_way_upgrade_options() {
+        let parse = |text: &str, action| parse_workspace_options(text.split_whitespace().map(str::to_owned), action);
+        assert!(parse("--id plain --directory plain", "adopt").unwrap().project_type.is_none());
+        assert_eq!(parse("--id plain --directory plain --type non-git --dry-run", "adopt").unwrap().project_type.as_deref(), Some("non-git"));
+        assert!(parse("--id plain --directory plain --type invalid", "adopt").is_err());
+        assert!(parse("--id plain --to standard --dry-run", "upgrade").unwrap().dry_run);
+        for args in ["--id plain", "--id plain --to non-git", "--id plain --to standard --type standard"] {
+            assert!(parse(args, "upgrade").is_err());
+        }
+    }
+
+    #[test]
     fn workspace_adopt_requires_explicit_directory_and_supports_flagged_dry_run() {
         assert!(parse_workspace_options(vec!["--id".into(), "k2-smb".into()].into_iter(), "adopt").is_err());
         let values = vec!["--id".into(), "k2-smb".into(), "--directory".into(), "k2-smb".into(), "--dry-run".into()];
@@ -794,6 +833,9 @@ mod tests {
         assert!(parse_multiplexer_options("start", args(&["--id", "demo", "--multiplexer", "tmux", "--approve-start"])).is_ok());
         assert!(parse_multiplexer_options("start", args(&["--id", "demo", "--approve-start", "--cmd", "sh"])).is_err());
         assert!(parse_multiplexer_options("attach", args(&["--id", "demo"])).is_err());
+        assert!(parse_multiplexer_options("attach", args(&["--id", "demo", "--multiplexer", "screen", "--window", "2"])).is_ok());
+        assert!(parse_multiplexer_options("attach", args(&["--id", "demo", "--multiplexer", "tmux", "--window", "2"])).is_err());
+        assert!(parse_multiplexer_options("attach", args(&["--id", "demo", "--multiplexer", "screen", "--window", "100"])).is_err());
         assert!(parse_multiplexer_options("attach", args(&["--id", "demo", "--multiplexer", "screen", "--expect-session-id", "123.g2c-demo"])).is_ok());
         assert!(parse_multiplexer_options("prefer", args(&["--bridge", "--multiplexer", "tmux"])).is_err());
         assert!(parse_multiplexer_options("prefer", args(&["--id", "demo", "--multiplexer", "tmux"])).is_ok());

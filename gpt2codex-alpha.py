@@ -77,11 +77,11 @@ def audit():
 
 
 def isolated_env(base):
-    for name in ['home', 'config/chatgpt2codex/projects', 'state', 'runtime', 'screens', 'repos/bridge/.git']:
+    for name in ['home', 'config/chatgpt2codex/projects', 'state', 'runtime', 'screens', 'repos/bridge']:
         (base / name).mkdir(parents=True, exist_ok=True, mode=0o700)
     config = base / 'config/chatgpt2codex'
     (config / 'config.toml').write_text('[workspace]\nproject_dir=' + json.dumps(str(base / 'repos')) + '\n')
-    (config / 'projects/gpt2codex.toml').write_text("[project]\nid='gpt2codex'\ndirectory='bridge'\n")
+    (config / 'projects/gpt2codex.toml').write_text("[project]\nid='gpt2codex'\ndirectory='bridge'\ntype='non-git'\n")
     return {'PATH': os.environ.get('PATH', os.defpath), 'HOME': str(base / 'home'),
             'XDG_CONFIG_HOME': str(base / 'config'), 'XDG_STATE_HOME': str(base / 'state'),
             'XDG_RUNTIME_DIR': str(base / 'runtime'), 'SCREENDIR': str(base / 'screens'),

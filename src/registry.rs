@@ -3,6 +3,7 @@
 //! This is NOT a remote file API. Before an MCP surface is enabled, context
 //! reads need kernel-enforced path resolution and outbound content filtering.
 
+use std::os::unix::fs::MetadataExt;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
@@ -128,9 +129,30 @@ struct ProjectGit {
     identity: GitIdentityMode,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectType {
+    #[default]
+    Standard,
+    NonGit,
+}
+impl ProjectType {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Standard => "standard", Self::NonGit => "non-git" }
+    }
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "standard" => Ok(Self::Standard), "non-git" => Ok(Self::NonGit),
+            _ => Err(RegistryError("unknown project type")),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectIdentity {
+    #[serde(default, rename = "type")]
+    project_type: ProjectType,
     id: String,
     directory: String,
     #[serde(default)]
@@ -173,6 +195,7 @@ impl Default for ContextConfig {
 
 #[derive(Debug, Clone)]
 pub struct Project {
+    pub project_type: ProjectType,
     pub id: String,
     pub name: String,
     pub root: PathBuf,
@@ -391,6 +414,17 @@ fn context_status(root: &Path, relative: &Path) -> Result<&'static str> {
 
 impl ProjectRegistry {
     pub fn load(config_path: &Path) -> Result<Self> {
+        Self::load_selected(config_path, None)
+    }
+
+    /// Validate all identities/paths; run Git only for the selected project.
+    /// This keeps non-git operations independent of Git in a mixed registry.
+    pub fn load_for(config_path: &Path, id: &str) -> Result<Self> {
+        validate_id(id)?;
+        Self::load_selected(config_path, Some(id))
+    }
+
+    fn load_selected(config_path: &Path, selected: Option<&str>) -> Result<Self> {
         let raw = read_small_utf8(config_path, MAX_CONFIG_BYTES)?;
         let config: GlobalConfig = toml::from_str(&raw).map_err(|_| RegistryError("invalid global TOML"))?;
         if !config.workspace.project_dir.is_absolute() {
@@ -465,10 +499,14 @@ impl ProjectRegistry {
                 return Err(RegistryError("project directory escapes project_dir"));
             }
             if !registered_roots.insert(root.clone()) { return Err(RegistryError("project directory registered multiple times")); }
-            let git_info = fs::symlink_metadata(root.join(".git"))
-                .map_err(|_| RegistryError("project is not a Git checkout"))?;
-            if git_info.file_type().is_symlink() || !(git_info.is_dir() || git_info.is_file()) {
-                return Err(RegistryError("unsafe Git metadata path"));
+            if root_info.uid() != unsafe { libc::geteuid() } { return Err(RegistryError("foreign project root")); }
+            if item.project.project_type == ProjectType::Standard {
+                let git_info = fs::symlink_metadata(root.join(".git"))
+                    .map_err(|_| RegistryError("project is not a Git checkout"))?;
+                if git_info.file_type().is_symlink() || !(git_info.is_dir() || git_info.is_file()) {
+                    return Err(RegistryError("unsafe Git metadata path"));
+                }
+                crate::workspace::validate_registered_checkout(&root, selected.is_none_or(|id| id == item.project.id)).map_err(|_| RegistryError("unsafe or invalid Git checkout"))?;
             }
             let name = item.project.name.unwrap_or_else(|| item.project.id.clone());
             check_text(&name, 80)?;
@@ -478,6 +516,7 @@ impl ProjectRegistry {
             validate_template(&name_template)?;
             check_unique(&item.contexts.files)?;
             let project = Project {
+                project_type: item.project.project_type,
                 id: item.project.id.clone(),
                 name,
                 root,
@@ -582,6 +621,21 @@ mod tests {
         assert_eq!(toml::from_str::<ProjectSessions>("multiplexer='tmux'").unwrap().multiplexer, Multiplexer::Tmux);
         assert!(toml::from_str::<ProjectSessions>("multiplexer='other'").is_err());
     }
+    #[test]
+    fn project_types_legacy_unknown_and_missing_git() {
+        let f = Fixture::new();
+        let path = f.root.join("cfg/projects/k2-smb.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        assert_eq!(ProjectRegistry::load(&f.config()).unwrap().project("k2-smb").unwrap().project_type, ProjectType::Standard);
+        fs::remove_dir_all(f.root.join("mycode/k2-smb/.git")).unwrap();
+        assert!(ProjectRegistry::load(&f.config()).is_err());
+        fs::create_dir(f.root.join("mycode/k2-smb/.git")).unwrap();
+        assert!(ProjectRegistry::load(&f.config()).is_err());
+        fs::write(&path, original.replace("[project]", "[project]\ntype='non-git'")).unwrap();
+        assert_eq!(ProjectRegistry::load(&f.config()).unwrap().project("k2-smb").unwrap().project_type, ProjectType::NonGit);
+        fs::write(&path, original.replace("[project]", "[project]\ntype='unknown'")).unwrap();
+        assert!(ProjectRegistry::load(&f.config()).is_err());
+    }
     use super::*;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -595,7 +649,7 @@ mod tests {
                 std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(root.join("mycode/k2-smb/.ai")).unwrap();
-            fs::create_dir_all(root.join("mycode/k2-smb/.git")).unwrap();
+            assert!(std::process::Command::new("git").args(["init", "-q"]).arg(root.join("mycode/k2-smb")).status().unwrap().success());
             fs::create_dir_all(root.join("mycode/.ai")).unwrap();
             fs::create_dir_all(root.join("cfg/projects")).unwrap();
             fs::write(root.join("mycode/.ai/CODEX_GLOBAL.md"), "Global instructions").unwrap();

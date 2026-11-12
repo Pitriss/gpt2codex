@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
 
 fn edited(raw: &str, mux: Multiplexer) -> Result<String> {
     // toml_edit is already used by toml; preserve comments and support both
@@ -55,10 +56,38 @@ fn read_owned(path: &Path) -> Result<(String, fs::Metadata)> {
     Ok((raw, info))
 }
 
+#[cfg(test)]
+thread_local! { pub(crate) static FAIL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+fn sync_directory(directory: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIRECTORY_SYNC.with(|flag| flag.replace(false)) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    directory.sync_all()
+}
+
+fn exchange(first: &Path, second: &Path) -> Result<()> {
+    let first = std::ffi::CString::new(first.as_os_str().as_bytes()).map_err(|_| err("invalid update path"))?;
+    let second = std::ffi::CString::new(second.as_os_str().as_bytes()).map_err(|_| err("invalid config path"))?;
+    if unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, first.as_ptr(),
+        libc::AT_FDCWD, second.as_ptr(), libc::RENAME_EXCHANGE) } != 0 {
+        return Err(err("atomic project config exchange failed"));
+    }
+    Ok(())
+}
+
 pub fn set(config: &Path, id: &str, mux: Multiplexer) -> Result<()> {
+    replace(config, id, false, |raw| edited(raw, mux), || Ok(()))
+}
+
+pub(crate) fn replace(
+    config: &Path, id: &str, dry_run: bool,
+    edit: impl Fn(&str) -> Result<String>, validate: impl Fn() -> Result<()>,
+) -> Result<()> {
     crate::registry::validate_id(id).map_err(|_| err("invalid project ID"))?;
     let registry =
-        ProjectRegistry::load(config).map_err(|_| err("cannot load project registry"))?;
+        ProjectRegistry::load_for(config, id).map_err(|_| err("cannot load project registry"))?;
     registry
         .project(id)
         .map_err(|_| err("project not registered"))?;
@@ -74,12 +103,14 @@ pub fn set(config: &Path, id: &str, mux: Multiplexer) -> Result<()> {
     }
     let lock = File::open(&dir).map_err(|_| err("cannot lock project config directory"))?;
     use std::os::fd::AsRawFd;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(err("preference lock failed"));
     }
     let path = dir.join(format!("{id}.toml"));
     let (raw, info) = read_owned(&path)?;
-    let replacement = edited(&raw, mux)?;
+    let replacement = edit(&raw)?;
+    validate()?;
+    if dry_run { return Ok(()); }
     let temporary = dir.join(format!(".{id}-mux-{}.pending", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
@@ -96,13 +127,24 @@ pub fn set(config: &Path, id: &str, mux: Multiplexer) -> Result<()> {
         if current != raw || metadata.dev() != info.dev() || metadata.ino() != info.ino() {
             return Err(err("project config changed concurrently"));
         }
-        fs::rename(&temporary, &path).map_err(|_| err("cannot replace project preference"))?;
-        lock.sync_all()
-            .map_err(|_| err("preference directory sync failed"))?;
+        validate()?;
+        // Keep the original inode at temporary until the commit is durable.
+        exchange(&temporary, &path)?;
+        if sync_directory(&lock).is_err() {
+            exchange(&temporary, &path)
+                .map_err(|_| err("directory sync and config rollback failed; inspect both files"))?;
+            let _ = lock.sync_all();
+            return Err(err("directory sync failed; original project config restored"));
+        }
+        // The commit succeeded. Cleanup failure must not misreport a rollback.
+        let _ = fs::remove_file(&temporary);
+        let _ = lock.sync_all();
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        if read_owned(&path).is_ok_and(|(current, _)| current == raw) {
+            let _ = fs::remove_file(&temporary);
+        }
     }
     result
 }

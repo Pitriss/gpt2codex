@@ -65,8 +65,10 @@ public:
 
     std::shared_ptr<Actor> start(const QString &project, const QString &mux) {
         const QString root = base + "/repos/" + project;
-        if (!privateDir(root + "/.git") || !write(base + "/c/projects/" + project + ".toml",
-                "[project]\nid='" + project.toUtf8() + "'\ndirectory='" + project.toUtf8() + "'\n")) { return {}; }
+        // Attention tests need a valid registered project, not an empty fake Git checkout.
+        // Non-Git is a supported project type and keeps this fixture independent of Git.
+        if (!privateDir(root) || !write(base + "/c/projects/" + project + ".toml",
+                "[project]\ntype='non-git'\nid='" + project.toUtf8() + "'\ndirectory='" + project.toUtf8() + "'\n")) { return {}; }
         const auto server = quint32(::getpid()); const auto provenance = g2cattention::marker::process(server);
         if (!provenance) { return {}; }
         auto actor = std::make_shared<Actor>();
@@ -103,7 +105,10 @@ public:
         actor->binding = QJsonDocument::fromJson(bytes(actor->directory + "/binding.json")).object();
         actors.append(actor);
         listing += "multiplexer=" + mux + " generation=" + actor->identity.generation + " project_id=" + project
-            + " screen_name=g2c-" + project + " state=detached session_id=" + actor->identity.sessionId + " task=Fixture\n";
+            + " screen_name=g2c-" + project + " state=detached session_id=" + actor->identity.sessionId
+            + " program=running exit_code=- exit_signal=- exited_at=-"
+            + (mux == "screen" ? " window=0 window_title=g2c-" + project : " window=- window_title=-")
+            + " task=Fixture\n";
         return actor;
     }
     QString mark(const std::shared_ptr<Actor> &actor) {

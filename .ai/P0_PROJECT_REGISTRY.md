@@ -110,3 +110,105 @@ The shared rules live in `project_dir/.ai/`, and templates for a future managed
 installation live in `.ai/templates/` of this repository (template version in
 `.ai/templates/VERSION`). P0-D does not write
 to `project_dir/.ai/` or any target project.
+
+## Explicit project types (Issue 32, 2026-11-11)
+
+`[project].type` accepts only `standard` and `non-git`. Missing type retains
+`standard` for old TOML. IDs, filename identity, unique canonical roots, owned
+root directories and path/symlink checks apply to both. Standard registration
+requires real Git metadata and a matching Git top-level. Read-only linked
+worktree registration remains supported; workspace writes still require a
+regular checkout. Non-git registration never runs Git against that project,
+even when an operator has subsequently added a `.git` directory. The type in
+the Rust registry is authoritative; existence of `.git` never upgrades it.
+
+Local CLI additions:
+
+```sh
+gpt2codex workspace adopt --id PROJECT_ID --directory DIRECTORY --type non-git --dry-run
+gpt2codex workspace adopt --id PROJECT_ID --directory DIRECTORY --type non-git
+gpt2codex workspace ensure --id PROJECT_ID
+gpt2codex workspace health --id PROJECT_ID
+gpt2codex project metadata --id PROJECT_ID
+```
+
+The adoption default is still standard. Non-git skips Git identity, tracked-file
+checks and excludes. Rules/context, history creation, owned volatile directories
+and exact `.tmp`/`.log` link checks remain common. Existing user files and valid
+managed links are preserved; unsafe/conflicting managed paths fail before writes.
+Both adoption and upgrade dry runs perform validation without filesystem writes.
+`project metadata` is a separate bounded JSON interface containing `id`, `root`
+and `type`; existing project listing output is unchanged.
+
+### One-way upgrade
+
+The operator must first prepare a valid regular Git checkout and its local
+`.git/info/exclude` outside the upgrade command. It must contain all managed
+entries: `/.tmp`, `/.log`, `/.ai/.project_codex.md`, `/.ai/CODEX_RESULTS.md`,
+`/CODEX_RESULTS.md`, `/.bash_history`. Upgrade refuses missing entries rather
+than changing Git or publishing a falsely ready standard project.
+
+```sh
+gpt2codex workspace upgrade --id PROJECT_ID --to standard --dry-run
+gpt2codex workspace upgrade --id PROJECT_ID --to standard
+```
+
+Only non-git to standard is supported. The standard workspace preflight runs
+again before replacement; missing Git, tracked reserved paths, unsafe paths,
+identity conflicts and changed config refuse the operation. The comment-preserving
+TOML edit shares the preference writer's directory lock, writes/fsyncs a new
+file and uses Linux atomic exchange. The old inode remains available until the
+directory sync succeeds; a sync error attempts atomic rollback. If both storage
+sync and rollback fail, diagnostics require manual inspection and preserve both
+files. No software transaction can promise recovery from a failing filesystem.
+No history, context, Git configuration, remote, session or Queue state is edited.
+Already-standard requests and downgrade targets are rejected.
+
+### Queue project-screen admission
+
+Only project-screen uses the new type gate. Configure optional absolute
+`bridge_cli` and `registry_config` in the existing private Queue configuration;
+defaults are `gpt2codex` from PATH and the Rust CLI's existing XDG/HOME registry
+location. An old/missing CLI or registry mismatch fails closed for standard and
+non-git alike. This does not change the backend default or existing approvals.
+
+Before the durable Queue claim, the worker holds a shared registry-directory
+lease, queries Rust JSON metadata and requires exact ID/canonical-root agreement
+with Queue project_roots. For non-git only, it checks the configured executable's
+`exec --help` for the exact `--skip-git-repo-check` flag. No login or model call
+is part of this capability probe. Unsupported CLI fails before claim with an
+explicit message. Existing ChatGPT identity, SHA/backend/host approval, anchor,
+process, window, FIFO and project execution lock checks still apply.
+
+The claimed job and private slot retain the validation proof, including executable
+SHA256/generation. Launch and runner revalidate it; changed/unknown evidence
+fails without resetting or replaying the claim. The runner acquires its own
+shared lease before start. Managed upgrades require the exclusive lock and fail
+while a Queue lease is held; different projects may hold shared leases together.
+Verified executable descriptors are used for metadata, capability probing and
+Codex exec, avoiding a pathname replacement between validation and execution.
+Only a verified non-git project-screen exec gets the skip flag. Standard and
+legacy exec/screen paths never get it. These cooperative locks do not provide
+an OS sandbox against a hostile process of the same UID editing files directly.
+
+### Later operator steps for txt-proc — not executed or authorized here
+
+After separate approval of enrollment, run each command individually and inspect
+its result. Use the newly built CLI and the operator's normal registry config:
+
+```sh
+gpt2codex workspace adopt --id txt-proc --directory txt-proc --type non-git --dry-run
+gpt2codex workspace adopt --id txt-proc --directory txt-proc --type non-git
+gpt2codex workspace ensure --id txt-proc
+gpt2codex workspace health --id txt-proc
+gpt2codex screen start --id txt-proc --anchor-only --approve-start
+```
+
+The final command is a separate live operator action, only after ready health
+and existing session/slot checks. Then follow the existing explicit Queue anchor
+preparation and approval workflow, with Rust root matching the future Queue
+allowlist. No txt-proc enrollment, Git initialization, screen start or Issue 30
+claim was performed in Issue 32. Issue 30 remains unapproved. A later upgrade
+uses the two upgrade commands above only after the operator prepares Git/excludes.
+Host live E2E, real txt-proc readiness and live anchor/Queue interoperability
+remain unverified; synthetic tests are not host evidence.

@@ -62,6 +62,16 @@ class QueueParallelTests(unittest.TestCase):
         self.dir_a.mkdir()
         self.dir_b.mkdir()
         self.store = Store(self.root)
+        # These baseline tests isolate screen/FIFO behavior; type admission has
+        # dedicated real Rust CLI regression coverage in project-types tests.
+        for name, replacement in (
+                ('registry_lease', contextlib.nullcontext),
+                ('preclaim', lambda *a: {'metadata': {'type': 'standard'}}),
+                ('validate_start', lambda *a: 'standard')):
+            patch = mock.patch.object(project, name, side_effect=replacement)
+            patch.start()
+            self.addCleanup(patch.stop)
+
         self.q = queue_module()
         self.cfg = {'project_screen_canary': True,
                     'project_parallel_canary': True,

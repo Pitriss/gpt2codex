@@ -638,3 +638,149 @@ Real Codex 0.163.0 instruction adherence, environment forwarding and sandbox
 visibility/write access still require a separately approved new isolated CLI
 smoke test. If namespace or permission checks fail, attention stays unavailable;
 there is no bypass, adoption or restart fallback. No such real CLI test was run.
+
+## Queue Worker monitor (Issue 17)
+
+The normal GUI pins **Queue Worker** in place of the old interactive Bridge
+page. It creates no terminal, attaches no Bridge session and starts no Codex
+turn. GitHub Queue retains its existing list, approval/TUI workflow and terminal;
+registered project tabs retain their existing backend and attach behavior.
+Bridge CLI/service functions remain available. `--queue-only` still opens only
+GitHub Queue.
+
+The monitor uses asynchronous, timed `systemctl --user show` queries for
+`gpt2codex-github-queue.service`. Bus failures show N/A. Host, configured backend,
+last successful poll and active issue phases come from the worker's sanitized
+`.log/github-queue/worker-monitor.json`, independent of exported XDG_STATE_HOME
+or SCREENDIR. The root is resolved from the existing project registry, with the
+queue-helper directory as fallback. Old/missing evidence is marked explicitly;
+restart-recovered unresolved claims show UNKNOWN and are never replayed.
+
+The worker emits allowlisted metadata in `worker-events.jsonl`: timestamps,
+fixed event types, issue number, approved sandbox mode and backend only. A
+screen runner records a real `turn.started` only after the validated Codex event;
+exec records launch attempts without claiming observed live turn telemetry. No
+prompts, exception bodies, Codex output or GitHub config enter these files.
+Successful polls produce one record per existing watch iteration (minimum 30s),
+not per remote response. One 1 MiB backup bounds retention. A separate file lock
+serializes the small metadata writes, not job execution. Monitor I/O failure
+cannot grant approval or change job execution. The GUI reads at most 256 KiB per
+tick, retains 2000 display blocks, tolerates partial records/rotation/truncation,
+and preserves the scroll position while reading history. It neither writes
+these files nor controls the worker.
+
+Two bars **below the log in Queue Worker** show remaining 300-minute and
+10080-minute capacity, identified by window duration, not primary/secondary
+order. Values are clamped `100 - usedPercent`; 1% is a nearly empty red warning.
+N/A is disabled and explicitly labeled, not an exhausted-limit assertion. Reset
+timestamps are Unix seconds, displayed in local-time tooltips. These are capacity
+percentages, not remaining token counts, and never block job approval or start.
+
+The read-only RPC client starts a short-lived local `codex app-server` stdio
+client, not a job or interactive session. Only initialize, initialized and
+`account/rateLimits/read` are sent; server requests are denied. It uses the
+existing Codex login internally, never reads auth files or logs raw RPC output,
+discards stderr and inherited API-key/PAT environment variables, times out after
+20s and caps the response at 1 MiB. Refresh is every 120s or manually using the
+button on the monitor. Missing method/account/windows produce N/A with a reason.
+The primary `codex` bucket wins over other categories; different windows or
+categories are described rather than relabeled. Workspace credit/spend-control
+details appear separately only when returned by the server.
+
+Protocol fields were checked against locally generated Codex CLI 0.166.0 JSON
+schema and [official App Server documentation](https://learn.chatgpt.com/docs/app-server).
+Schema inspection and mock RPC tests do not establish authenticated production
+rate-limit E2E. No service restart or live-session operation is performed by this
+implementation job. A running old worker needs a separately scheduled operator
+reload before it can emit the new metadata; the GUI shows N/A/empty evidence in
+the meantime, without inventing worker activity.
+
+Operator acceptance, in order:
+
+1. After current queue work finishes, schedule deployment/reload of the new
+   worker using the existing service procedure. This is not done by the GUI or
+   this implementation task. Keep the default exec/backend configuration.
+2. Run the rebuilt normal GUI on the workstation. Verify Queue Worker is pinned,
+   the large log scrolls without jumping while reading history, and both bars
+   remain below it at small window sizes. Check the existing Queue list/TUI and
+   project tabs without closing any job slot. Verify host/poll/issue phases from
+   fresh worker evidence and a genuine service status.
+3. With the existing ChatGPT login, manually refresh limits. Compare actual
+   300/10080-minute windows, remaining percentages and reset tooltips to the
+   account's CLI view. If unavailable, preserve N/A and record the reason; never
+   parse the TUI for numeric fallback. Record this as authenticated E2E only
+   after actual success.
+4. Only after those checks, optionally retire the legacy Bridge using the
+   following explicit one-shot operator procedure. It is never startup logic.
+
+Legacy Bridge retirement procedure (prepared, NOT RUN):
+
+- Wait until the process currently occupying Bridge has finished. Obtain fresh
+  `gpt2codex session status --bridge --multiplexer screen` using the operator's
+  normal production config/environment, with test XDG_STATE_HOME and SCREENDIR
+  unset. Require the registered full ID to be exactly `<pid>.g2c-bridge`, the
+  expected owner, matching recorded PID/start ticks, and a detached session.
+  Do not derive identity from a name match or inspect any other screen registry.
+- Independently inspect that PID's local process tree and foreground process
+  groups. Require an idle shell with no running/waiting Codex, job, child command
+  or attached client. Uncertain identity/activity, an attached session or missing
+  provenance means STOP; do not detach anything to make the check pass.
+- The operator explicitly confirms the exact full ID and the observed idle
+  state. Immediately recheck the same PID/start ticks, ownership, detached state
+  and idle tree. If any evidence changed, cancel this attempt.
+- Only then issue `screen -S <verified-full-id> -X quit` once for that exact
+  legacy ID. Verify its disappearance with the registered status command.
+  Never use a prefix, wildcard, `screen -wipe`, or any command addressing Queue
+  #8 or project sessions. Do not delete registry files as part of this step.
+
+
+## Activity-aware project tabs
+
+Project tabs are created only for a verified active Codex program, not merely
+for a registered project or a live GNU screen server. The read-only Rust
+`session list --program-status` query inventories the registered screen
+windows using `screen -Q windows`; an anchor-only `g2c-anchor` is reported as
+`program=anchor` and is never a project terminal. A manual screen Codex is
+recognized only in the registered window titled exactly `g2c-<project>`. GUI
+attachment carries that verified window number and Rust rechecks the registered
+screen identity and exact target title before `screen -p N -x/-r`. No window is
+selected or changed during discovery. Empty/unregistered/anchor-only projects
+are hidden. Queue `codex exec --json` remains non-interactive and is not falsely
+presented as a TUI; a separate read-only project event view is a follow-up phase.
+
+## GitHub Queue: instalace a automatické nalezení helperů
+
+Při instalaci CMake/Debian jsou `gpt2codex_queue_screen.py`,
+`gpt2codex-github-queue.py` a jejich lokální Python moduly uloženy společně do
+`/usr/share/gpt2codex/`. GUI hledá **oba** skripty v jedné složce; samotný
+`gpt2codex-github-queue.py` není platná hodnota `--queue-helper`.
+Standardní desktopové spuštění `gpt2codex-gui` nepotřebuje žádné explicitní
+`--queue-helper` ani `--bridge-cli`.
+
+Pracovní adresář Queue Workera není instalační cesta skriptů. GUI jej získá z
+privátní konfigurace `~/.config/gpt2codex/github-queue/config.json`, z položky
+`project_roots.gpt2codex`, a požaduje existující `.tmp/` a `.log/`.
+Při lokálním spuštění ze zdrojů může použít sousední checkout helperu.
+Pro všechny čtecí i schvalovací příkazy pak předává stejný
+`--repo-root`, takže zobrazí původní úlohy a logy běžícího workeru.
+Když pracovní adresář chybí, Queue zobrazí diagnostiku a nepracuje s
+`/usr/share` jako s náhradním stavovým úložištěm.
+Instalace nepřidává službu ani nestartuje Codex.
+
+## GitHub Queue: dvoupanelové schvalování (lokální GUI)
+
+Záložka GitHub Queue má vlevo seznam úloh se dvěma řádky na položku
+(`#číslo project_id stav` a název); vpravo zobrazuje ověřené kompletní zadání,
+SHA-256, potvrzovací checkbox, volbu Schválit/Zamítnout a tlačítko OK.
+Neobsahuje terminál ani tlačítko pro vytváření úloh. Výběr položky nic
+nespouští. Detail ověřuje `gui-detail` proti původní Issue a lokální identitě.
+
+Schválení provádí pouze explicitní lokální klik s potvrzeným checkboxem
+přes `gui-approve --digest ... --confirmation ...`; CLI znovu ověřuje vzdálený
+digest a lokální `pending` stav, zapisuje `approved-project-screen` a
+neprovádí spuštění Codexu. Již schválené legacy úlohy se nepřevádějí.
+Worker je může převzít svým stávajícím mechanismem. Nepřipravený projekt
+se zablokuje v jeho dosavadním preclaimu. `gui-list` čte jen lokální metadata
+se skutečným nezkráceným názvem; pro ověření detailu je potřeba GitHub token
+v existující lokální Queue konfiguraci. Neplatná či změněná Issue se v GUI
+nesmí schválit.

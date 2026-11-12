@@ -1061,7 +1061,7 @@ mod tests {
         fs::create_dir(f.path.join(".ai")).unwrap();
         fs::create_dir(f.path.join("cfg")).unwrap();
         fs::create_dir(f.path.join("cfg/projects")).unwrap();
-        fs::create_dir(f.root("one").join(".git")).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(f.root("one")).status().unwrap().success());
         let config = f.path.join("cfg/config.toml");
         fs::write(
             &config,

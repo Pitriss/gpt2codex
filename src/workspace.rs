@@ -3,7 +3,7 @@
 //! This module intentionally has no MCP write surface. CLI invocation is the
 //! human-authorized write boundary in P0-E; managed remote approvals come later.
 
-use crate::registry::{validate_id, validate_relative, ProjectRegistry};
+use crate::registry::{validate_id, validate_relative, ProjectRegistry, ProjectType};
 use serde::Deserialize;
 use std::error::Error;
 use std::fmt;
@@ -50,6 +50,7 @@ fn io_error(label: &'static str, cause: std::io::Error) -> WorkspaceError {
 
 #[derive(Debug)]
 pub struct AdoptRequest {
+    pub project_type: ProjectType,
     pub config_path: PathBuf,
     pub id: String,
     pub directory: String,
@@ -146,7 +147,7 @@ fn ensure_history(root: &Path) -> Result<()> {
 }
 
 // Notes describe metadata only. They never downgrade workspace readiness.
-fn history_notices(root: &Path) -> Vec<&'static str> {
+fn history_notices(root: &Path, standard: bool) -> Vec<&'static str> {
     let path = root.join(".bash_history");
     let mut notes = Vec::new();
     match lstat(&path) {
@@ -161,13 +162,15 @@ fn history_notices(root: &Path) -> Vec<&'static str> {
         Ok(None) => (),
         Err(_) => notes.push("metadata_unavailable"),
     }
-    match git_call(root, &["ls-files", "--", ".bash_history"]) {
-        Ok(result) if result.status.success() && !result.stdout.is_empty() => {
-            notes.push("git_tracked_not_untracked");
+    if standard {
+        match git_call(root, &["ls-files", "--", ".bash_history"]) {
+            Ok(result) if result.status.success() && !result.stdout.is_empty() => {
+                notes.push("git_tracked_not_untracked");
+            }
+            Ok(result) if !result.status.success() => notes.push("git_tracking_unknown"),
+            Err(_) => notes.push("git_tracking_unknown"),
+            _ => (),
         }
-        Ok(result) if !result.status.success() => notes.push("git_tracking_unknown"),
-        Err(_) => notes.push("git_tracking_unknown"),
-        _ => (),
     }
     notes
 }
@@ -278,8 +281,18 @@ fn ensure_link(root: &Path, id: &str, temp_base: &Path, kind: &str) -> Result<()
     }
 }
 
+#[cfg(test)]
+thread_local! { static GIT_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 fn git_call(root: &Path, params: &[&str]) -> Result<Output> {
-    let output = Command::new("git").arg("-C").arg(root).args(params)
+    #[cfg(test)]
+    GIT_FORBIDDEN.with(|blocked| assert!(!blocked.get(), "unexpected Git subprocess"));
+    let mut command = Command::new("git");
+    // Ignore inherited repository selectors: the registered root is authority.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") { command.env_remove(key); }
+    }
+    let output = command.arg("-C").arg(root).args(params)
         .output().map_err(|e| io_error("cannot run git", e))?;
     Ok(output)
 }
@@ -338,6 +351,41 @@ fn git_exclude_path(root: &Path) -> Result<PathBuf> {
     Ok(info.join("exclude"))
 }
 
+pub(crate) fn validate_registered_checkout(root: &Path, run_git: bool) -> Result<()> {
+    let git = root.join(".git");
+    let meta = lstat(&git)?.ok_or_else(|| error("Git metadata missing"))?;
+    if meta.file_type().is_symlink() || meta.uid() != euid() {
+        return Err(error("unsafe Git metadata"));
+    }
+    if meta.is_dir() {
+        check_directory(&git, false)?;
+        if !safe_regular(&git.join("config"))? || !safe_regular(&git.join("HEAD"))? {
+            return Err(error("Git config or HEAD missing"));
+        }
+    } else if meta.is_file() {
+        // Preserve read-only linked-worktree registration. Managed writes still
+        // require a regular checkout through git_exclude_path.
+        let text = read_bounded(&git)?;
+        let target = text.trim_end().strip_prefix("gitdir: ").ok_or_else(|| error("invalid worktree Git file"))?;
+        let directory = root.join(target);
+        if !check_directory(&directory, false)? || !safe_regular(&directory.join("HEAD"))? {
+            return Err(error("unsafe worktree Git directory"));
+        }
+    } else { return Err(error("invalid Git metadata")); }
+    if !run_git { return Ok(()); }
+    let out = git_call(root, &["rev-parse", "--show-toplevel"])?;
+    if !out.status.success() || Path::new(std::str::from_utf8(&out.stdout)
+        .map_err(|_| error("invalid Git root"))?.trim_end()) != root {
+        return Err(error("Git checkout root mismatch"));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_git_checkout(root: &Path) -> Result<()> {
+    git_exclude_path(root)?;
+    validate_registered_checkout(root, true)
+}
+
 fn missing_excludes(root: &Path) -> Result<Vec<&'static str>> {
     let file = git_exclude_path(root)?;
     let data = if safe_regular(&file)? { read_bounded(&file)? } else { String::new() };
@@ -377,8 +425,6 @@ fn validate_root(project_dir: &Path, directory: &str) -> Result<(PathBuf, PathBu
     if !check_directory(&root, false)? { return Err(error("project checkout directory does not exist")); }
     let root = root.canonicalize().map_err(|e| io_error("cannot resolve checkout", e))?;
     if root.parent() != Some(project_dir.as_path()) { return Err(error("checkout escapes project_dir")); }
-    // Git worktrees are read-only supported, but write bootstrap is intentionally restricted.
-    git_exclude_path(&root)?;
     Ok((project_dir, root))
 }
 
@@ -389,7 +435,9 @@ fn validate_input(req: &BootstrapRequest) -> Result<(PathBuf, PathBuf)> {
     if !req.git_email.contains('@') || req.git_email.contains(' ') { return Err(error("invalid Git email")); }
     check_text(&req.codex_name, 80)?;
     if !req.config_path.is_absolute() { return Err(error("config path must be absolute")); }
-    validate_root(&req.project_dir, &req.directory)
+    let paths = validate_root(&req.project_dir, &req.directory)?;
+    validate_git_checkout(&paths.1)?;
+    Ok(paths)
 }
 
 fn config_text(req: &BootstrapRequest, project_dir: &Path) -> Result<String> {
@@ -413,7 +461,7 @@ struct StoredGitSection { user_name: Option<String>, user_email: Option<String> 
 #[derive(Deserialize)]
 struct StoredProject { project: StoredProjectSection }
 #[derive(Deserialize)]
-struct StoredProjectSection { id: String, directory: String }
+struct StoredProjectSection { id: String, directory: String, #[serde(default, rename = "type")] project_type: ProjectType }
 
 fn validate_existing_global(path: &Path, dir: &Path, req: &BootstrapRequest) -> Result<()> {
     if !safe_regular(path)? { return Ok(()); }
@@ -433,7 +481,7 @@ fn validate_existing_global(path: &Path, dir: &Path, req: &BootstrapRequest) -> 
 fn validate_existing_project(path: &Path, req: &BootstrapRequest) -> Result<()> {
     if !safe_regular(path)? { return Ok(()); }
     let data: StoredProject = toml::from_str(&read_bounded(path)?).map_err(|_| error("existing project config is invalid"))?;
-    if data.project.id != req.id || data.project.directory != req.directory {
+    if data.project.id != req.id || data.project.directory != req.directory || data.project.project_type != ProjectType::Standard {
         return Err(error("existing project ID or directory conflicts with bootstrap"));
     }
     Ok(())
@@ -500,7 +548,7 @@ fn install_shared(root: &Path, rules: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn preflight_ensure(root: &Path, rules: &Path, id: &str, temp_base: &Path, git_name: Option<&str>, git_email: Option<&str>) -> Result<()> {
+fn preflight_ensure(root: &Path, rules: &Path, id: &str, temp_base: &Path, git_name: Option<&str>, git_email: Option<&str>, standard: bool) -> Result<()> {
     check_tmp_base(temp_base)?;
     // Detect all common conflicts before changing any file.
     preflight_shared(root, rules)?;
@@ -514,19 +562,18 @@ fn preflight_ensure(root: &Path, rules: &Path, id: &str, temp_base: &Path, git_n
             }
         }
     }
-    missing_excludes(root)?;
+    if standard { validate_git_checkout(root)?; missing_excludes(root)?; preflight_git_reserved(root)?; }
     history_status(root)?;
-    preflight_git_reserved(root)?;
     if let (Some(name), Some(email)) = (git_name, git_email) { preflight_git(root, name, email)?; }
     Ok(())
 }
 
-fn do_ensure(root: &Path, rules: &Path, id: &str, temp_base: &Path, git_name: Option<&str>, git_email: Option<&str>) -> Result<()> {
-    preflight_ensure(root, rules, id, temp_base, git_name, git_email)?;
+fn do_ensure(root: &Path, rules: &Path, id: &str, temp_base: &Path, git_name: Option<&str>, git_email: Option<&str>, standard: bool) -> Result<()> {
+    preflight_ensure(root, rules, id, temp_base, git_name, git_email, standard)?;
     // All of these are idempotent, create-only operations or validated additions.
     ensure_tmp_directory(temp_base, id)?;
     install_shared(root, rules, id)?;
-    ensure_excludes(root)?;
+    if standard { ensure_excludes(root)?; }
     ensure_history(root)?;
     ensure_link(root, id, temp_base, "tmp")?;
     ensure_link(root, id, temp_base, "log")?;
@@ -565,8 +612,8 @@ fn bootstrap_with_tmp(req: &BootstrapRequest, temp_base: &Path) -> Result<()> {
     // Re-parse all configurations: catches conflicts with other registered projects.
     let registry = ProjectRegistry::load(&req.config_path).map_err(|e| error(e.to_string()))?;
     let registered = registry.project(&req.id).map_err(|e| error(e.to_string()))?;
-    if registered.root != root { return Err(error("registered project does not match requested checkout")); }
-    do_ensure(&root, &registry.rules_dir, &req.id, temp_base, Some(&req.git_name), Some(&req.git_email))
+    if registered.root != root || registered.project_type != ProjectType::Standard { return Err(error("registered project does not match requested checkout")); }
+    do_ensure(&root, &registry.rules_dir, &req.id, temp_base, Some(&req.git_name), Some(&req.git_email), true)
 }
 
 /// Adopt an existing checkout without changing its Git author, tracked files or existing AI docs.
@@ -587,13 +634,13 @@ fn adopt_with_tmp(req: &AdoptRequest, temp_base: &Path, dry_run: bool) -> Result
     validate_id(&req.id).map_err(|e| error(e.to_string()))?;
     if !req.config_path.is_absolute() { return Err(error("config path must be absolute")); }
     check_tmp_base(temp_base)?;
-    let registry = ProjectRegistry::load(&req.config_path).map_err(|e| error(e.to_string()))?;
+    let registry = ProjectRegistry::load_for(&req.config_path, &req.id).map_err(|e| error(e.to_string()))?;
     let (project_dir, root) = validate_root(&registry.project_dir, &req.directory)?;
     let (cfg_dir, projects) = safe_config_home(&req.config_path)?;
     let config_file = projects.join(format!("{}.toml", req.id));
     let registered = registry.projects().find(|entry| entry.id.as_str() == req.id.as_str() || entry.root.as_path() == root.as_path());
     if let Some(existing) = registered {
-        if existing.id != req.id || existing.root != root || existing.manage_git_identity {
+        if existing.id != req.id || existing.root != root || existing.manage_git_identity || existing.project_type != req.project_type {
             return Err(error("project ID or checkout is already registered with different settings"));
         }
     }
@@ -606,27 +653,27 @@ fn adopt_with_tmp(req: &AdoptRequest, temp_base: &Path, dry_run: bool) -> Result
     let had_context = safe_regular(&root.join("PROJECT_CONTEXT.md"))?
         || safe_regular(&root.join(".ai/PROJECT_CONTEXT.md"))?;
     let rules = project_dir.join(".ai");
-    preflight_ensure(&root, &rules, &req.id, temp_base, None, None)?;
+    preflight_ensure(&root, &rules, &req.id, temp_base, None, None, req.project_type == ProjectType::Standard)?;
     if !already_registered {
         let configured = quote(&req.id)?;
         let directory = quote(&req.directory)?;
         let contents = format!(
-            "[project]\nid = {configured}\ndirectory = {directory}\n\n[git]\nidentity = \"preserve\"\n\n[contexts]\nfiles = [\n  \"AGENTS.md\",\n  \".ai/.project_codex.md\",\n  \".ai/PROJECT_CONTEXT.md\",\n  \".ai/CODEX_RESULTS.md\",\n  \"PROJECT_CONTEXT.md\",\n  \"CODEX_RESULTS.md\",\n]\n"
+            "[project]\nid = {configured}\ndirectory = {directory}\ntype = {}\n\n[git]\nidentity = \"preserve\"\n\n[contexts]\nfiles = [\n  \"AGENTS.md\",\n  \".ai/.project_codex.md\",\n  \".ai/PROJECT_CONTEXT.md\",\n  \".ai/CODEX_RESULTS.md\",\n  \"PROJECT_CONTEXT.md\",\n  \"CODEX_RESULTS.md\",\n]\n", quote(req.project_type.as_str())?
         );
         // Validate syntax before touching any project files.
         toml::from_str::<toml::Value>(&contents).map_err(|_| error("invalid generated TOML"))?;
         if !dry_run {
-            do_ensure(&root, &rules, &req.id, temp_base, None, None)?;
+            do_ensure(&root, &rules, &req.id, temp_base, None, None, req.project_type == ProjectType::Standard)?;
             create_config_dirs(&cfg_dir, &projects)?;
             ensure_new_file(&config_file, &contents, true)?;
         }
     } else if !dry_run {
-        do_ensure(&root, &rules, &req.id, temp_base, None, None)?;
+        do_ensure(&root, &rules, &req.id, temp_base, None, None, req.project_type == ProjectType::Standard)?;
     }
     if !dry_run {
-        let updated = ProjectRegistry::load(&req.config_path).map_err(|e| error(e.to_string()))?;
+        let updated = ProjectRegistry::load_for(&req.config_path, &req.id).map_err(|e| error(e.to_string()))?;
         let project = updated.project(&req.id).map_err(|e| error(e.to_string()))?;
-        if project.root != root || project.manage_git_identity { return Err(error("registration postcondition failed")); }
+        if project.root != root || project.manage_git_identity || project.project_type != req.project_type { return Err(error("registration postcondition failed")); }
     }
     Ok(AdoptReport { root, had_agents, had_context, already_registered })
 }
@@ -636,12 +683,45 @@ pub fn ensure(config_path: &Path, project_id: &str) -> Result<()> {
 }
 
 fn ensure_with_tmp(config_path: &Path, id: &str, temp_base: &Path) -> Result<()> {
-    let registry = ProjectRegistry::load(config_path).map_err(|e| error(e.to_string()))?;
+    let registry = ProjectRegistry::load_for(config_path, id).map_err(|e| error(e.to_string()))?;
     let project = registry.project(id).map_err(|e| error(e.to_string()))?;
-    git_exclude_path(&project.root)?;
-    let name = registry.git_user_name.as_deref().filter(|_| project.manage_git_identity);
-    let email = registry.git_user_email.as_deref().filter(|_| project.manage_git_identity);
-    do_ensure(&project.root, &registry.rules_dir, id, temp_base, name, email)
+    let standard = project.project_type == ProjectType::Standard;
+    if standard { validate_git_checkout(&project.root)?; }
+    let name = registry.git_user_name.as_deref().filter(|_| standard && project.manage_git_identity);
+    let email = registry.git_user_email.as_deref().filter(|_| standard && project.manage_git_identity);
+    do_ensure(&project.root, &registry.rules_dir, id, temp_base, name, email, standard)
+}
+
+/// Explicit one-way metadata transaction. The operator prepares Git and its
+/// excludes first; this operation never initializes Git or edits project data.
+pub fn upgrade(config: &Path, id: &str, dry_run: bool) -> Result<()> {
+    upgrade_with_tmp(config, id, dry_run, Path::new("/tmp"))
+}
+
+fn upgrade_with_tmp(config: &Path, id: &str, dry_run: bool, temp: &Path) -> Result<()> {
+    let validate = || -> crate::screen::Result<()> {
+        let registry = ProjectRegistry::load_for(config, id).map_err(|e| crate::screen::err(e.to_string()))?;
+        let project = registry.project(id).map_err(|e| crate::screen::err(e.to_string()))?;
+        if project.project_type != ProjectType::NonGit {
+            return Err(crate::screen::err("upgrade requires a non-git project"));
+        }
+        let check = || -> Result<()> {
+            let name = registry.git_user_name.as_deref().filter(|_| project.manage_git_identity);
+            let email = registry.git_user_email.as_deref().filter(|_| project.manage_git_identity);
+            preflight_ensure(&project.root, &registry.rules_dir, id, temp, name, email, true)?;
+            if !missing_excludes(&project.root)?.is_empty() {
+                return Err(error("prepare managed Git excludes before upgrade"));
+            }
+            Ok(())
+        };
+        check().map_err(|e| crate::screen::err(e.to_string()))
+    };
+    crate::project_preference::replace(config, id, dry_run, |raw| {
+        let mut doc = raw.parse::<toml_edit::DocumentMut>()
+            .map_err(|_| crate::screen::err("invalid project TOML"))?;
+        doc["project"]["type"] = toml_edit::value("standard");
+        Ok(doc.to_string())
+    }, validate).map_err(|e| error(e.to_string()))
 }
 
 /// Verify that a versioned managed block is either absent, or has exactly the
@@ -717,9 +797,10 @@ pub fn health(config_path: &Path, project_id: &str) -> Result<Health> {
 }
 
 fn health_with_tmp(config_path: &Path, id: &str, temp_base: &Path) -> Result<Health> {
-    let registry = ProjectRegistry::load(config_path).map_err(|e| error(e.to_string()))?;
+    let registry = ProjectRegistry::load_for(config_path, id).map_err(|e| error(e.to_string()))?;
     let project = registry.project(id).map_err(|e| error(e.to_string()))?;
     check_tmp_base(temp_base)?;
+    preflight_shared(&project.root, &registry.rules_dir)?;
     let mut checks = Vec::new();
     let rule_files_ok = SHARED_FILES.iter().all(|(name, _)| safe_regular(&registry.rules_dir.join(name)).unwrap_or(false));
     checks.push(("global_rules", if rule_files_ok { "ok" } else { "missing_or_unsafe" }));
@@ -734,8 +815,8 @@ fn health_with_tmp(config_path: &Path, id: &str, temp_base: &Path) -> Result<Hea
         checks.push((if kind == "tmp" { "tmp_link" } else { "log_link" },
             if expected_link_status(&project.root, id, temp_base, kind).unwrap_or(false) { "ok" } else { "missing_or_conflict" }));
     }
+    if project.project_type == ProjectType::Standard {
     checks.push(("git_exclude", if missing_excludes(&project.root).is_ok_and(|entries| entries.is_empty()) { "ok" } else { "missing_or_unsafe" }));
-    checks.push(("bash_history", if history_status(&project.root).unwrap_or(false) { "ok" } else { "missing" }));
     if project.manage_git_identity {
         if let (Some(name), Some(email)) = (registry.git_user_name.as_deref(), registry.git_user_email.as_deref()) {
             let valid = git_local(&project.root, "user.name")?.as_deref() == Some(name)
@@ -745,7 +826,9 @@ fn health_with_tmp(config_path: &Path, id: &str, temp_base: &Path) -> Result<Hea
     } else {
         checks.push(("git_identity", "ok")); // Git author settings deliberately untouched.
     }
-    let history_notices = history_notices(&project.root);
+    }
+    checks.push(("bash_history", if history_status(&project.root).unwrap_or(false) { "ok" } else { "missing" }));
+    let history_notices = history_notices(&project.root, project.project_type == ProjectType::Standard);
     Ok(Health { project_id: id.to_owned(), root: project.root.clone(), checks, history_notices })
 }
 
@@ -781,6 +864,82 @@ mod tests {
         fn repo(&self) -> PathBuf { self.request.project_dir.join(&self.request.directory) }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.base); } }
+
+    #[test]
+    fn non_git_lifecycle_dry_run_types_conflicts_and_upgrade() {
+        let f = Fixture::new();
+        let cfg = f.request.config_path.parent().unwrap();
+        fs::create_dir_all(cfg.join("projects")).unwrap();
+        fs::set_permissions(cfg, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(cfg.join("projects"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&f.request.config_path, config_text(&f.request, &f.request.project_dir).unwrap()).unwrap();
+        let root = f.request.project_dir.join("plain");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("AGENTS.md"), "keep agents").unwrap();
+        fs::write(root.join("PROJECT_CONTEXT.md"), "keep context").unwrap();
+        fs::write(root.join(".bash_history"), "keep history").unwrap();
+        fs::write(cfg.join("projects/gpt2codex.toml"), project_text(&f.request).unwrap()).unwrap();
+        let mut req = adopt_request(&f, "plain", "plain");
+        req.project_type = ProjectType::NonGit;
+        GIT_FORBIDDEN.with(|b| b.set(true));
+        assert!(adopt_with_tmp(&req, &f.tmp, true).is_ok());
+        assert!(!root.join(".ai").exists());
+        assert!(!root.join(".tmp").exists());
+        assert!(!cfg.join("projects/plain.toml").exists());
+        adopt_with_tmp(&req, &f.tmp, false).unwrap();
+        ensure_with_tmp(&f.request.config_path, "plain", &f.tmp).unwrap();
+        assert!(health_with_tmp(&f.request.config_path, "plain", &f.tmp).unwrap().ready());
+        fs::remove_dir_all(f.tmp.join("plain")).unwrap();
+        assert!(!health_with_tmp(&f.request.config_path, "plain", &f.tmp).unwrap().ready());
+        ensure_with_tmp(&f.request.config_path, "plain", &f.tmp).unwrap();
+        assert!(health_with_tmp(&f.request.config_path, "plain", &f.tmp).unwrap().ready());
+        assert!(!root.join(".git").exists());
+        assert_eq!(fs::read_to_string(root.join(".bash_history")).unwrap(), "keep history");
+        assert_eq!(fs::read_to_string(root.join("PROJECT_CONTEXT.md")).unwrap(), "keep context");
+        assert_eq!(fs::read_to_string(root.join("AGENTS.md")).unwrap(), "keep agents");
+        let mut duplicate = adopt_request(&f, "other", "plain");
+        duplicate.project_type = ProjectType::NonGit;
+        assert!(adopt_with_tmp(&duplicate, &f.tmp, false).is_err());
+        GIT_FORBIDDEN.with(|b| b.set(false));
+        let path = cfg.join("projects/plain.toml");
+        let original = fs::read(&path).unwrap();
+        for dry in [true, false] {
+            assert!(upgrade_with_tmp(&f.request.config_path, "plain", dry, &f.tmp).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        assert!(Command::new("git").args(["init", "-q"]).arg(&root).status().unwrap().success());
+        assert!(upgrade_with_tmp(&f.request.config_path, "plain", false, &f.tmp).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        GIT_FORBIDDEN.with(|b| b.set(true));
+        ensure_with_tmp(&f.request.config_path, "plain", &f.tmp).unwrap();
+        assert!(health_with_tmp(&f.request.config_path, "plain", &f.tmp).unwrap().ready());
+        GIT_FORBIDDEN.with(|b| b.set(false));
+        assert!(!missing_excludes(&root).unwrap().is_empty());
+        ensure_excludes(&root).unwrap();
+        upgrade_with_tmp(&f.request.config_path, "plain", true, &f.tmp).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let pending = cfg.join(format!("projects/.plain-mux-{}.pending", std::process::id()));
+        fs::write(&pending, "collision").unwrap();
+        assert!(upgrade_with_tmp(&f.request.config_path, "plain", false, &f.tmp).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_file(pending).unwrap();
+        let validations = std::cell::Cell::new(0);
+        assert!(crate::project_preference::replace(&f.request.config_path, "plain", false,
+            |raw| Ok(raw.replace("non-git", "standard")), || {
+                validations.set(validations.get() + 1);
+                if validations.get() == 2 { Err(crate::screen::err("injected late preflight failure")) } else { Ok(()) }
+            }).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!cfg.join(format!("projects/.plain-mux-{}.pending", std::process::id())).exists());
+        crate::project_preference::FAIL_DIRECTORY_SYNC.with(|flag| flag.set(true));
+        assert!(upgrade_with_tmp(&f.request.config_path, "plain", false, &f.tmp).unwrap_err().to_string().contains("original project config restored"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        upgrade_with_tmp(&f.request.config_path, "plain", false, &f.tmp).unwrap();
+        assert_eq!(ProjectRegistry::load(&f.request.config_path).unwrap().project("plain").unwrap().project_type, ProjectType::Standard);
+        assert!(health_with_tmp(&f.request.config_path, "plain", &f.tmp).unwrap().ready());
+        assert!(upgrade_with_tmp(&f.request.config_path, "plain", false, &f.tmp).is_err());
+        assert_eq!(fs::read_to_string(root.join(".bash_history")).unwrap(), "keep history");
+    }
 
     #[test]
     fn bootstrap_self_repo_creates_expected_paths_and_git_identity() {
@@ -872,7 +1031,7 @@ mod tests {
     }
 
     fn adopt_request(f: &Fixture, id: &str, directory: &str) -> AdoptRequest {
-        AdoptRequest { config_path: f.request.config_path.clone(), id: id.into(), directory: directory.into() }
+        AdoptRequest { project_type: ProjectType::Standard, config_path: f.request.config_path.clone(), id: id.into(), directory: directory.into() }
     }
 
     #[test]

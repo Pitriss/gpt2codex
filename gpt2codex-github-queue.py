@@ -27,6 +27,7 @@ import uuid
 sys.dont_write_bytecode = True
 import gpt2codex_queue_handoff as handoff
 import gpt2codex_queue_dispatch as dispatch
+from gpt2codex_queue_codex import git_check_options
 
 VERSION = 1
 MAX_RESPONSE = 8 * 1024 * 1024
@@ -119,6 +120,9 @@ def load_config(filename):
         raise QueueError("codex_bin must be an absolute path")
     if not isinstance(cfg.get("token_file"), str) or not Path(cfg["token_file"]).expanduser().is_absolute():
         raise QueueError("token_file must be an absolute path")
+    for key in ('bridge_cli', 'registry_config'):
+        if key in cfg and (not isinstance(cfg[key], str) or not Path(cfg[key]).is_absolute()):
+            raise QueueError(f'{key} must be an absolute path')
     execution_backend(cfg)
     if 'project_screen_canary' in cfg and type(cfg['project_screen_canary']) is not bool:
         raise QueueError('project_screen_canary must be boolean')
@@ -294,6 +298,84 @@ def parse_issue(issue, cfg):
             "task": task, "digest": digest}
 
 
+EVENT_NAMES = frozenset(("poll", "approved", "claimed", "screen_started",
+                         "turn_started", "turn_completed", "handoff_published",
+                         "failed", "worker_started", "poll_failed", "blocked", "unknown", "launch_started"))
+EVENT_MAX_BYTES = 1024 * 1024
+
+
+def worker_event(store, event, number=None, backend=None, mode=None):
+    """Best-effort, allowlisted operational metadata; never exception/payload text.
+
+    One bounded backup and an atomic compact snapshot, serialized across CLI and
+    worker threads/processes. Monitoring failure never changes job authorization.
+    """
+    if event not in EVENT_NAMES:
+        return
+    try:
+        now = int(time.time())
+        row = {"v": 1, "ts": now, "event": event}
+        if type(number) is int and number > 0:
+            row["issue"] = number
+        if backend in ("exec", "screen", "project-screen"):
+            row["backend"] = backend
+        if mode in ("read-only", "workspace-write"):
+            row["mode"] = mode
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(store.log_dir / "events.lock", flags, 0o600), "r+") as lock:
+            st = os.fstat(lock.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+                raise QueueError("Monitor lock invalid")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            snapshot = store.log_dir / "worker-monitor.json"
+            view = {"v": 1, "active": {}}
+            if snapshot.exists():
+                secure_private_file(snapshot)
+                view = json.loads(snapshot.read_text())
+                if view.get("v") != 1 or not isinstance(view.get("active"), dict):
+                    view = {"v": 1, "active": {}}
+            if event == "worker_started":
+                # Atomic queue state is the authority after a worker restart.
+                # Never replay unresolved claims; surface them for operator review.
+                view["active"] = {}
+                for job in store.load()["jobs"].values():
+                    if job.get("status") in ("running", "unknown"):
+                        n = job.get("number")
+                        if type(n) is int and n > 0:
+                            view["active"][str(n)] = {"issue": n, "event": "unknown",
+                                **{k: job[k] for k in ("backend", "mode")
+                                   if job.get(k) in ("exec", "screen", "project-screen", "read-only", "workspace-write")}}
+            view["updated_at"] = now
+            if event in ("poll", "worker_started", "poll_failed"):
+                view["host"] = socket.gethostname()[:128]
+                view["backend"] = row.get("backend", "unknown")
+                if event == "poll":
+                    view["last_poll"] = now
+                view["poll_error"] = event == "poll_failed"
+            key = str(number)
+            if event in ("claimed", "screen_started", "turn_started", "unknown", "launch_started") and "issue" in row:
+                view["active"][key] = {k: v for k, v in row.items() if k in ("issue", "backend", "mode", "event")}
+            elif event in ("turn_completed", "failed"):
+                view["active"].pop(key, None)
+            data = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+            path = store.log_dir / "worker-events.jsonl"
+            if path.exists():
+                secure_private_file(path, EVENT_MAX_BYTES + 1024)
+                if path.stat().st_size + len(data) > EVENT_MAX_BYTES:
+                    os.replace(path, store.log_dir / "worker-events.jsonl.1")
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                                  getattr(os, "O_NOFOLLOW", 0), 0o600), "ab") as log:
+                log.write(data)
+            temp = store.log_dir / "worker-monitor.json.new"
+            with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC |
+                                  getattr(os, "O_NOFOLLOW", 0), 0o600), "w") as output:
+                json.dump(view, output, separators=(",", ":"))
+            os.replace(temp, snapshot)
+    except (OSError, ValueError, TypeError, AttributeError, QueueError):
+        # Fixed warning only: no paths, token material or remote error bodies.
+        print("WORKER_MONITOR_UNAVAILABLE", file=sys.stderr, flush=True)
+
+
 class Store:
     def __init__(self, repo_root):
         self.tmp_dir = private_dir(repo_root / ".tmp" / "github-queue")
@@ -381,6 +463,56 @@ def scan(api, store, cfg):
     return added
 
 
+def gui_list(store):
+    """Complete untruncated local issue metadata; no token/network needed."""
+    with store.lock():
+        jobs = store.load()['jobs'].values()
+        data = [{k: job.get(k) for k in ('number', 'status', 'project', 'mode', 'digest', 'title')}
+                for job in jobs]
+    print(json.dumps(sorted(data, key=lambda j: j['number']), ensure_ascii=False))
+
+
+def gui_activity(store, cfg):
+    """Read-only, network-free activity for the visible GUI project tabs.
+
+    The stored queue status is admission metadata, not proof that Codex is
+    alive. The separate runtime_verified flag represents only verified screen
+    server/window presence. Never expose raw event payloads or prompt files.
+    """
+    import gpt2codex_queue_screen as slots
+    with store.lock():
+        active = [dict(job) for job in store.load()['jobs'].values()
+                  if job.get('status') == 'running']
+    rows = []
+    for job in sorted(active, key=lambda j: j['number']):
+        number, project = job.get('number'), job.get('project')
+        if type(number) is not int or number <= 0 or project not in cfg['project_roots']:
+            continue
+        row = {'number': number, 'project': project, 'title': job.get('title', ''),
+               'queue_status': 'running', 'backend': job.get('backend', 'exec'),
+               'phase': 'claim_pending', 'runtime_verified': False,
+               'turns_started': 0, 'turns_completed': 0, 'events': []}
+        slot_name = job.get('screen_slot')
+        if slot_name:
+            try:
+                slot = slots.find_slot(store.log_dir.parent.parent, slot_name)
+                spec = slots.read(slot / 'spec.json')
+                if (spec.get('number') != number or spec.get('project') != project
+                        or spec.get('digest') != job.get('digest')
+                        or spec.get('backend', 'screen') != row['backend']):
+                    raise RuntimeError('Queue slot identity mismatch')
+                phase = slots.read(slot / 'phase.json')
+                row['phase'] = phase.get('phase', 'unverified')
+                row['turns_started'] = phase.get('turns_started', 0)
+                row['turns_completed'] = phase.get('turns_completed', 0)
+                row['runtime_verified'] = slots.runtime_verified(slot, spec)
+                row['events'] = slots.recent_activity(slot)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                row['phase'] = 'unverified'
+        rows.append(row)
+    print(json.dumps(rows, ensure_ascii=False))
+
+
 def show_jobs(store, active_only=False):
     with store.lock():
         values = list(store.load()["jobs"].values())
@@ -449,8 +581,58 @@ def approve(api, store, cfg, number, prefix, backend=None):
         job["status"] = {"exec": "approved", "screen": "approved-screen",
                          "project-screen": "approved-project-screen"}[backend]
         store.save(state)
+    worker_event(store, "approved", number, backend, item["mode"])
     print(f"APPROVED #{number}; will run only on configured host")
     print(f"Backend: {backend}; watch / run-approved will claim automatically")
+
+
+def gui_detail(api, store, cfg, number):
+    """JSON detail for a selected issue; approval identity stays remote-bound."""
+    issue = api.issue(number)
+    if not isinstance(issue, dict):
+        raise QueueError("Remote issue unavailable")
+    # Closed issues can be displayed too. They cannot be approved.
+    check = dict(issue)
+    check['state'] = 'open'
+    item = parse_issue(check, cfg)
+    with store.lock():
+        job = store.load()['jobs'].get(str(number))
+    if not job:
+        raise QueueError("Issue is not in local queue")
+    if not item or job['id'] != item['id'] or job['digest'] != item['digest']:
+        raise QueueError("Remote Issue changed or invalid; refresh required")
+    print(json.dumps({**item, 'status': job['status'],
+                      'remote_state': issue.get('state'),
+                      'approved_backend': job.get('backend')}, ensure_ascii=False))
+
+
+def gui_approve(api, store, cfg, number, digest, confirmation):
+    """Explicit local GUI confirmation, identical digest/race rules as TTY approve.
+
+    GUI must supply the exact confirmation only after an operator checks the
+    checkbox and clicks OK. This interface is local-only, not remotely exposed.
+    """
+    if confirmation != f'SCHVALUJI {number}':
+        raise QueueError('GUI approval confirmation mismatch')
+    backend = 'project-screen'
+    require_runnable_backend(backend, cfg)
+    item = validated_remote(api, store, cfg, number, ('pending',))
+    if digest != item['digest']:
+        raise QueueError('Issue SHA-256 changed; no approval')
+    # Re-fetch immediately before the durable local write.
+    check = validated_remote(api, store, cfg, number, ('pending',))
+    if check['digest'] != digest:
+        raise QueueError('Issue changed during GUI approval')
+    with store.lock():
+        state = store.load()
+        job = state['jobs'].get(str(number))
+        if not job or job['status'] != 'pending' or job['digest'] != digest:
+            raise QueueError('Local approval changed; refresh required')
+        job['backend'] = backend
+        job['worker_host'] = cfg['worker_hostname']
+        job['status'] = 'approved-project-screen'
+        store.save(state)
+    print(f'APPROVED #{number}; project-screen; worker will claim automatically')
 
 
 def reject(store, number):
@@ -548,6 +730,11 @@ def run_one(api, store, cfg, number, backend='exec'):
 
 
 def execute_claimed(api, store, cfg, number, backend):
+    with contextlib.ExitStack() as leases:
+        return _execute_claimed(api, store, cfg, number, backend, leases)
+
+
+def _execute_claimed(api, store, cfg, number, backend, leases):
     require_runnable_backend(backend, cfg)
     # Reject changed or incompatible backend bindings before any remote access.
     with store.lock():
@@ -559,6 +746,8 @@ def execute_claimed(api, store, cfg, number, backend):
                 "project-screen": ("approved-project-screen",)})[backend]
     item = validated_remote(api, store, cfg, number, allowed)
     project_dir = secure_project_dir(cfg["project_roots"][item["project"]])
+    item['_approved_project_root'] = project_dir
+    options = git_check_options(project_dir, project_dir)
     codex = Path(cfg["codex_bin"])
     if not codex.is_file() or not os.access(codex, os.X_OK):
         raise QueueError("Configured codex binary unavailable")
@@ -568,6 +757,13 @@ def execute_claimed(api, store, cfg, number, backend):
         # Recheck again inside the launcher immediately before screen -X.
         import gpt2codex_queue_project as project_backend
         import gpt2codex_queue_screen as screen_backend
+        try:
+            # PRECLAIM validation is read-only. Hold the registry lease through
+            # completion; the persisted proof fixes type/root/executable binding.
+            leases.enter_context(project_backend.registry_lease(project_backend.registry_config(cfg)))
+            item['_project_validation'] = project_backend.preclaim(cfg, item['project'], project_dir, str(codex))
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            raise QueueError(f"project-screen preclaim refused: {exc}") from None
         try:
             project_backend.anchor_ready(store, item["project"], project_dir)
             screen_backend.require_chatgpt(str(codex), screen_backend.clean_env())
@@ -599,6 +795,12 @@ def execute_claimed(api, store, cfg, number, backend):
                     raise QueueError('Unresolved legacy claim; cannot overlap')
         elif any(j['status'] == 'running' for j in unresolved):
             raise QueueError('Unresolved running claim; review before starting another job')
+        if backend == "project-screen":
+            try:
+                project_backend.validate_start(item["_project_validation"], item["project"], project_dir, str(codex))
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                raise QueueError(f"project-screen preclaim changed: {exc}") from None
+            job["project_validation"] = item["_project_validation"]
         job["status"] = "running"
         job["backend"] = backend
         job["worker_host"] = cfg["worker_hostname"]
@@ -610,6 +812,7 @@ def execute_claimed(api, store, cfg, number, backend):
             job["handoff_nonce"] = uuid.uuid4().hex
             item["_handoff_nonce"] = job["handoff_nonce"]
         store.save(state)
+    worker_event(store, "claimed", number, backend, item["mode"])
     report_path = None
     if "_handoff_nonce" in item:
         name = f"handoff-{number}-{item['_handoff_nonce']}"
@@ -621,7 +824,7 @@ def execute_claimed(api, store, cfg, number, backend):
     env = os.environ.copy()
     for key in ("GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY"):
         env.pop(key, None)
-    cmd = [str(codex), "exec", "--sandbox", item["mode"], "-C", project_dir, "-"]
+    cmd = [str(codex), "exec", "--sandbox", item["mode"], "-C", project_dir, *options, "-"]
     exit_code = 127
     result_known = backend == "exec"
     try:
@@ -655,6 +858,7 @@ def execute_claimed(api, store, cfg, number, backend):
                 store.save(state)
             result_known = True
         elif backend == "exec":
+            worker_event(store, "launch_started", number, backend, item["mode"])
             exit_code = run_exec(cmd, project_dir, env, item, outpath, errpath)
         else:
             raise QueueError("Unrecognized backend: execution refused")
@@ -676,6 +880,7 @@ def execute_claimed(api, store, cfg, number, backend):
                                   "report_diagnostic": diagnostic,
                                   "diagnostic": "publication_pending", "attempts": 0}
             store.save(state)
+    worker_event(store, "turn_completed" if status == "done" else "unknown" if status == "unknown" else "failed", number, backend, item["mode"])
     # Keep the legacy receipt and all its public metadata.
     note = (f"G2C-QUEUE/1\nworker={cfg['worker_hostname']}\n"
             f"request_sha256={item['digest']}\nstatus={status}\nexit_code={exit_code}\n"
@@ -711,6 +916,12 @@ def run_exec(cmd, project_dir, env, item, outpath, errpath):
         raise QueueError(str(exc)) from None
     exit_code = 127
     try:
+        if '_approved_project_root' in item:
+            # Recheck immediately before launch; a changed root must not reuse
+            # a trust decision made before the single-use claim.
+            expected = git_check_options(project_dir, item['_approved_project_root'])
+            if ('--skip-git-repo-check' in cmd) != bool(expected):
+                raise RuntimeError('Git metadata changed before launch')
         fd_out = os.open(outpath, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             fd_err = os.open(errpath, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -746,8 +957,10 @@ def _run_one_logged(api, store, cfg, number, backend):
     try:
         return run_one(api, store, cfg, number, backend)
     except QueueError as exc:
+        worker_event(store, "blocked", number, backend)
         print(f'BLOCKED #{number}: {exc}', file=sys.stderr, flush=True)
     except Exception as exc:
+        worker_event(store, "unknown", number, backend)
         # Never print process environment, GitHub responses or task contents.
         print(f'QUEUE_ERROR #{number}: {type(exc).__name__}', file=sys.stderr, flush=True)
 
@@ -781,6 +994,7 @@ def _dispatch_parallel(api, store, cfg, pool, inflight, jobs, attempted=None):
         try:
             backend = approved_backend(job)
         except QueueError as exc:
+            worker_event(store, "blocked", number)
             print(f'BLOCKED #{number}: {exc}', file=sys.stderr, flush=True)
             continue
         if backend == 'project-screen':
@@ -813,6 +1027,7 @@ def run_approved(api, store, cfg, *, pool=None, inflight=None):
             try:
                 backend = approved_backend(job)
             except QueueError as exc:
+                worker_event(store, "blocked", number)
                 print(f'BLOCKED #{number}: {exc}', file=sys.stderr, flush=True)
                 continue
             _run_one_logged(api, store, cfg, number, backend)
@@ -871,6 +1086,7 @@ def publish_handoff(api, store, cfg, number):
                 out["phase"] = "published"
                 out["diagnostic"] = "remote_confirmed"
                 store.save(state)
+                worker_event(store, "handoff_published", number)
                 return True
             if out["phase"] in ("posting", "uncertain"):
                 out["phase"] = "uncertain"
@@ -898,6 +1114,8 @@ def publish_handoff(api, store, cfg, number):
         except (QueueError, OSError, ValueError, TypeError):
             out["diagnostic"] = "reconciliation_unavailable"
             store.save(state)
+        if out["phase"] == "published":
+            worker_event(store, "handoff_published", number)
         print(f"HANDOFF #{number}: {out['phase']} ({out['diagnostic']})", flush=True)
         return out["phase"] == "published"
 
@@ -1007,6 +1225,8 @@ def main(argv=None):
     sub.add_parser("poll")
     sub.add_parser("list")
     sub.add_parser("list-active", help="Only pending, waiting, blocked and running jobs")
+    sub.add_parser("gui-list", help="Full local queue metadata as JSON")
+    sub.add_parser("gui-activity", help="Read-only sanitized activity of running project jobs")
     for name in ("project-ready", "project-prepare-anchor"):
         project_command = sub.add_parser(name, help="Project-screen canary operator preflight")
         project_command.add_argument("project")
@@ -1018,6 +1238,12 @@ def main(argv=None):
     app.add_argument("--backend", choices=("exec", "screen", "project-screen"), default=None)
     rej = sub.add_parser("reject")
     rej.add_argument("number", type=int)
+    gd = sub.add_parser('gui-detail', help='JSON full task, verified against local queue identity')
+    gd.add_argument('number', type=int)
+    ga = sub.add_parser('gui-approve', help='Local GUI operator approval, SHA-bound')
+    ga.add_argument('number', type=int)
+    ga.add_argument('--digest', required=True)
+    ga.add_argument('--confirmation', required=True)
     sub.add_parser("run-approved")
     screen = sub.add_parser("run-screen", help="One approved Issue in a NEW isolated screen slot")
     screen.add_argument("number", type=int)
@@ -1039,6 +1265,12 @@ def main(argv=None):
         raise QueueError("Project .tmp/.log managed directories missing; no bootstrap attempted")
     if args.action in ("list", "list-active"):
         show_jobs(Store(repo_root), active_only=args.action == "list-active")
+        return 0
+    if args.action == "gui-list":
+        gui_list(Store(repo_root))
+        return 0
+    if args.action == "gui-activity":
+        gui_activity(Store(repo_root), cfg)
         return 0
     if args.action in ("project-ready", "project-prepare-anchor"):
         import gpt2codex_queue_project as project_backend
@@ -1096,6 +1328,11 @@ def main(argv=None):
     elif args.action == "approve":
         api.validate_repo()
         approve(api, store, cfg, args.number, args.digest_prefix, args.backend)
+    elif args.action == 'gui-detail':
+        gui_detail(api, store, cfg, args.number)
+    elif args.action == 'gui-approve':
+        api.validate_repo()
+        gui_approve(api, store, cfg, args.number, args.digest, args.confirmation)
     elif args.action == "run-screen":
         return run_one(api, store, cfg, args.number, backend="screen")
     elif args.action == "run-approved":
@@ -1114,6 +1351,7 @@ def main(argv=None):
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise QueueError("Another watcher is running") from None
+            worker_event(store, "worker_started", backend=execution_backend(cfg))
             print("WATCHING private GitHub queue (new tasks always require local approval)", flush=True)
             with contextlib.ExitStack() as stack:
                 pool = (stack.enter_context(ThreadPoolExecutor(
@@ -1123,6 +1361,7 @@ def main(argv=None):
                 while True:
                     try:
                         added = scan(api, store, cfg)
+                        worker_event(store, "poll", backend=execution_backend(cfg))
                         if added and shutil.which("notify-send"):
                             with store.lock():
                                 new_jobs = {k: store.load()["jobs"].get(k) for k in added}
@@ -1139,6 +1378,7 @@ def main(argv=None):
                                     pass
                         run_approved(api, store, cfg, pool=pool, inflight=inflight)
                     except QueueError as exc:
+                        worker_event(store, "poll_failed", backend=execution_backend(cfg))
                         print(f"QUEUE_WARNING: {exc}", file=sys.stderr, flush=True)
                     time.sleep(args.interval)
     return 0

@@ -24,6 +24,8 @@ pub struct ProgramStatus {
     pub exit_code: Option<u32>,
     pub signal: Option<String>,
     pub exited_at: Option<u64>,
+    pub window_number: Option<u32>,
+    pub window_title: Option<String>,
 }
 impl ProgramStatus {
     pub fn unknown() -> Self {
@@ -32,6 +34,24 @@ impl ProgramStatus {
             ..Self::default()
         }
     }
+}
+
+fn screen_program(config: &Path, target: Target<'_>, view: &Status) -> ProgramStatus {
+    if !matches!(view.state, "attached" | "detached") { return ProgramStatus::unknown(); }
+    let windows = match screen::windows_for_status(config, target, view) {
+        Ok(value) => value,
+        Err(_) => return ProgramStatus::unknown(),
+    };
+    let codex = windows.iter().filter(|window| window.title == view.screen_name).collect::<Vec<_>>();
+    if codex.len() == 1 {
+        return ProgramStatus { state: "running", window_number: Some(codex[0].number),
+            window_title: Some(codex[0].title.clone()), ..ProgramStatus::default() };
+    }
+    if codex.is_empty() && windows.len() == 1 && windows[0].title == "g2c-anchor" {
+        return ProgramStatus { state: "anchor", window_number: Some(windows[0].number),
+            window_title: Some(windows[0].title.clone()), ..ProgramStatus::default() };
+    }
+    ProgramStatus::unknown()
 }
 
 fn command(socket: &Path) -> Command {
@@ -330,10 +350,11 @@ pub fn list(config: &Path) -> Result<Vec<ManagedStatus>> {
         ProjectRegistry::load(config).map_err(|_| err("cannot load project registry"))?;
     let mut result: Vec<_> = screen::list_for_multiplexers(config)?
         .into_iter()
-        .map(|status| ManagedStatus {
-            multiplexer: Multiplexer::Screen,
-            status,
-            program: ProgramStatus::unknown(),
+        .map(|status| {
+            let target = if status.project_id == "bridge" { Target::Bridge }
+                else { Target::Project(&status.project_id) };
+            let program = screen_program(config, target, &status);
+            ManagedStatus { multiplexer: Multiplexer::Screen, status, program }
         })
         .collect();
     let mut targets = vec![Target::Bridge];
@@ -488,10 +509,12 @@ pub fn attach(
     target: Target<'_>,
     expected: Option<&str>,
     expected_ticks: Option<u64>,
+    expected_window: Option<u32>,
 ) -> Result<()> {
     if mux == Multiplexer::Screen {
-        return screen::attach_checked(config, target, expected, expected_ticks);
+        return screen::attach_checked(config, target, expected, expected_ticks, expected_window);
     }
+    if expected_window.is_some() { return Err(err("window selection is supported only by GNU screen")); }
     let view = status(config, mux, target)?;
     if !matches!(view.state, "attached" | "detached") {
         return Err(err("tmux identity unconfirmed; attach refused"));
@@ -668,6 +691,7 @@ fn parse_program(raw: &str, session: &str, pane: &str) -> Result<ProgramStatus> 
             exit_code,
             signal,
             exited_at,
+            ..ProgramStatus::default()
         });
     }
     found.ok_or_else(|| err("recorded pane missing; no adoption"))
@@ -675,7 +699,9 @@ fn parse_program(raw: &str, session: &str, pane: &str) -> Result<ProgramStatus> 
 
 pub fn details(config: &Path, mux: Multiplexer, target: Target<'_>) -> Result<ManagedStatus> {
     let view = status(config, mux, target)?;
-    let mut program = ProgramStatus::unknown();
+    let mut program = if mux == Multiplexer::Screen {
+        screen_program(config, target, &view)
+    } else { ProgramStatus::unknown() };
     if mux == Multiplexer::Tmux && matches!(view.state, "attached" | "detached") {
         let state = screen::state_dir(false)?;
         let record = screen::read_record(&record_path(&state, target)?)?

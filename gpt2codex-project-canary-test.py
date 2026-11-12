@@ -57,6 +57,17 @@ class CanaryTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.store = Store(self.root)
+        # These baseline tests isolate screen/FIFO behavior; type admission has
+        # dedicated real Rust CLI regression coverage in project-types tests.
+        for name, replacement in (
+                ('registry_lease', contextlib.nullcontext),
+                ('pinned_executable', lambda *a: contextlib.nullcontext({})),
+                ('preclaim', lambda *a: {'metadata': {'type': 'standard'}}),
+                ('validate_start', lambda *a: 'standard')):
+            patch = mock.patch.object(project, name, side_effect=replacement)
+            patch.start()
+            self.addCleanup(patch.stop)
+
         self.item = {'number': 27, 'id': 1010, 'title': 'Example', 'project': 'gpt2codex',
                      'digest': 'a' * 64, 'mode': 'read-only', 'task': 'Summarize project'}
         self.store.data['jobs']['27'] = {'status': 'running', 'number': 27,
@@ -108,7 +119,8 @@ class CanaryTests(unittest.TestCase):
         slots.write(slot / 'spec.json', {'backend': 'project-screen', 'number': 27,
                                          'project': 'gpt2codex', 'digest': 'a' * 64,
                                          'mode': 'read-only', 'codex': '/not/a/real/codex',
-                                         'cwd': str(self.root), 'prompt': str(prompt)})
+                                         'cwd': str(self.root), 'prompt': str(prompt),
+                                         'project_validation': {'config': 'unused', 'codex_stamp': []}})
         tid = '01a1c4cd-dac1-7531-af18-8f8f8bf95677'
         data = b''.join(json.dumps(e).encode() + b'\n' for e in [
             {'type': 'thread.started', 'thread_id': tid},

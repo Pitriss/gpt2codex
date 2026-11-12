@@ -9,7 +9,7 @@ Homepage: https://github.com/Pitriss/gpt2codex
 
 Package: gpt2codex
 Architecture: amd64 arm64 armhf
-Depends: ${shlibs:Depends}, ${misc:Depends}, git, screen
+Depends: ${shlibs:Depends}, ${misc:Depends}, python3, git, screen
 Recommends: konsole-kpart (>= 4:25.04), qt6-svg-plugins, breeze-icon-theme
 Suggests: tmux
 Description: local Codex bridge and Qt6 persistent terminal views (alpha)

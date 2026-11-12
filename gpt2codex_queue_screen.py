@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in queue task slots. Never queries or controls the project mux registry."""
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
@@ -15,6 +16,7 @@ import time
 import uuid
 
 from gpt2codex_queue_dispatch import DispatchError, require_legacy_launch_allowed
+from gpt2codex_queue_codex import codex_options
 
 SLOT_RE = re.compile(r"q[0-9]+-[0-9a-f]{12}\Z")
 
@@ -95,13 +97,6 @@ def identity(slot):
     return saved
 
 
-def codex_options(mode, cwd):
-    if mode not in ('read-only', 'workspace-write'):
-        raise RuntimeError('Invalid sandbox')
-    return ['-c', 'model_provider="openai"', '-c', 'approval_policy="never"',
-            '--sandbox', mode, '-C', cwd]
-
-
 def require_chatgpt(codex, env):
     # Metadata-only CLI check; never read or copy auth/config files. No login/logout.
     proc = subprocess.run([codex, 'login', 'status'], env=env, capture_output=True, timeout=15)
@@ -132,6 +127,10 @@ def prepare_slot(store, item, codex, cwd, prompt, backend='screen'):
     spec = {'number': item['number'], 'project': item['project'], 'digest': item['digest'],
             'mode': item['mode'], 'cwd': cwd, 'codex': codex, 'backend': backend,
             'prompt': str(prompt_path.resolve()), 'name': 'g2c' + slot.name}
+    if backend == 'project-screen':
+        spec['project_validation'] = item.get('_project_validation')
+    if '_approved_project_root' in item:
+        spec['approved_project_root'] = item['_approved_project_root']
     spec['queue_repo_root'] = str(store.log_dir.parent.parent.resolve())
     spec['issue_id'] = item['id']
     spec['worker_host'] = socket.gethostname()
@@ -252,20 +251,60 @@ def record_thread(spec, slot, thread_id):
         store.save(state)
 
 
+def monitor_event(spec, event):
+    """Best-effort metadata from observed runner transitions, never raw events."""
+    if 'queue_repo_root' not in spec:
+        return  # Old/manual slots have no queue monitor binding.
+    try:
+        module_spec = importlib.util.spec_from_file_location(
+            '_queue_monitor', Path(__file__).with_name('gpt2codex-github-queue.py'))
+        queue = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(queue)
+        queue.worker_event(queue.Store(Path(spec['queue_repo_root'])), event,
+                           spec['number'], spec.get('backend', 'screen'), spec['mode'])
+    except Exception:
+        # Monitoring cannot interrupt a turn or change its result.
+        pass
+
+
+def slot_options(spec):
+    approved_root = spec.get('approved_project_root')
+    if spec.get('backend') == 'project-screen':
+        import gpt2codex_queue_project as project
+        kind = project.validate_start(spec.get('project_validation'), spec['project'],
+                                      spec['cwd'], spec['codex'])
+        if kind == 'non-git':
+            approved_root = spec['cwd']
+    return codex_options(spec['mode'], spec['cwd'], approved_root)
+
+
+def exec_arguments(spec):
+    return [spec['codex'], 'exec', *slot_options(spec), '--json']
+
+
+def resume_arguments(spec, thread_id):
+    return [spec['codex'], 'resume', *slot_options(spec), thread_id]
+
+
 def runner(slot):
     require_legacy_launch_allowed()
     # Single-run marker is exclusive even if somebody invokes the runner twice.
     fd = os.open(slot / 'runner.claim', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     os.close(fd)
     spec = read(slot / 'spec.json')
+    monitor_event(spec, 'screen_started')
     events = Events()
     proc = None
+    leases = contextlib.ExitStack()
     rc = 127
     try:
         require_legacy_launch_allowed()
         env = clean_env()
         require_chatgpt(spec['codex'], env)
-        args = [spec['codex'], 'exec', *codex_options(spec['mode'], spec['cwd']), '--json']
+        if spec.get('backend') == 'project-screen':
+            import gpt2codex_queue_project as project
+            leases.enter_context(project.registry_lease(spec['project_validation']['config']))
+        args = exec_arguments(spec)
         if 'report_path' in spec:
             args += ['--output-schema', spec['schema_path'], '--output-last-message', spec['report_path']]
         args += ['-']
@@ -274,8 +313,13 @@ def runner(slot):
                 (slot / 'exec.stderr').open('xb') as err:
             os.chmod(slot / 'events.jsonl', 0o600)
             os.chmod(slot / 'exec.stderr', 0o600)
-            proc = subprocess.Popen(args, stdin=prompt, stdout=subprocess.PIPE, stderr=err,
-                                    cwd=spec['cwd'], env=env, start_new_session=True)
+            with contextlib.ExitStack() as executables:
+                pinned = {}
+                if spec.get('backend') == 'project-screen':
+                    pinned = executables.enter_context(project.pinned_executable(
+                        spec['codex'], spec['project_validation']['codex_stamp']))
+                proc = subprocess.Popen(args, stdin=prompt, stdout=subprocess.PIPE, stderr=err,
+                                        cwd=spec['cwd'], env=env, start_new_session=True, **pinned)
             write(slot / 'phase.json', events.metadata('exec_starting'))
             # Alarm bounds the whole pipe stream, including a hung/oversized event.
             def timeout(signum, frame):
@@ -289,7 +333,10 @@ def runner(slot):
                     raise RuntimeError('Exec output limit')
                 output.write(line)
                 output.flush()
+                was_started = events.started
                 events.accept(json.loads(line))
+                if events.started and not was_started:
+                    monitor_event(spec, 'turn_started')
                 if events.thread_id and not spec.get('_thread_recorded'):
                     record_thread(spec, slot, events.thread_id)
                     spec['_thread_recorded'] = True
@@ -309,6 +356,7 @@ def runner(slot):
                 proc.wait()
         rc = 125
         write(slot / 'error.json', {'error_type': type(exc).__name__, 'retry': False})
+    leases.close()
     result = {**events.metadata('turn_finished'), 'exit_code': rc, 'finished_at': int(time.time())}
     write(slot / 'phase.json', result)
     write(slot / 'result.json', result)  # Worker waits for this, NEVER screen startup/exit.
@@ -316,7 +364,7 @@ def runner(slot):
         return rc
     try:
         require_legacy_launch_allowed()
-        args = [spec['codex'], 'resume', *codex_options(spec['mode'], spec['cwd']), events.thread_id]
+        args = resume_arguments(spec, events.thread_id)
         write(slot / 'resume.json', {'thread_id': events.thread_id, 'prompt_supplied': False,
                                     'verification': 'NOT PROVEN', 'argv': args})
         # The runner already owns the screen PTY. No stuffing, shell, or second prompt.
@@ -326,7 +374,7 @@ def runner(slot):
                                    'tui_ready': 'NOT PROVEN'})
         tui_rc = tui.wait()
         write(slot / 'phase.json', {**result, 'phase': 'tui_exited', 'tui_exit_code': tui_rc})
-    except (OSError, DispatchError) as exc:
+    except (OSError, RuntimeError, DispatchError) as exc:
         write(slot / 'phase.json', {**result, 'phase': 'tui_failed',
                                    'error_type': type(exc).__name__})
         return 2
@@ -366,6 +414,92 @@ def completed_turn(slot, phase):
         return False
 
 
+# Queue activity is intentionally sanitized before it crosses into the GUI.
+# In particular, never serialize command lines, tool output, model responses,
+# file paths, or raw Codex event objects to the presentation process.
+_EVENT_LABELS = {
+    'thread.started': 'Vlákno Codexu založeno',
+    'turn.started': 'Zpracování zahájeno',
+    'turn.completed': 'Zpracování dokončeno',
+    'turn.failed': 'Zpracování selhalo',
+    'error': 'Codex ohlásil chybu',
+}
+_ITEM_LABELS = {
+    'command_execution': 'Práce s terminálovým nástrojem',
+    'file_change': 'Změny souborů',
+    'agent_message': 'Zpráva Codexu',
+    'reasoning': 'Vyhodnocování postupu',
+    'web_search': 'Vyhledávání',
+    'mcp_tool_call': 'Volání nástroje',
+    'collab_agent_tool_call': 'Spolupracující agent',
+}
+
+
+def recent_activity(slot):
+    """Return only allowlisted event categories from a bounded log tail."""
+    path = slot / 'events.jsonl'
+    if not path.exists():
+        return []
+    with private(path).open('rb') as stream:
+        stream.seek(0, os.SEEK_END)
+        start = max(0, stream.tell() - 2 * 1024 * 1024)
+        stream.seek(start)
+        if start:
+            stream.readline()  # A possibly incomplete leading event.
+        chunk = stream.read(2 * 1024 * 1024)
+    if not chunk.endswith(b'\n'):
+        chunk = chunk.rsplit(b'\n', 1)[0] + b'\n' if b'\n' in chunk else b''
+    labels = []
+    for line in chunk.splitlines():
+        if len(line) > 1024 * 1024:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue  # The writer may still be publishing the last record.
+        if not isinstance(obj, dict):
+            continue
+        kind = obj.get('type')
+        label = _EVENT_LABELS.get(kind) if isinstance(kind, str) else None
+        if kind in ('item.started', 'item.completed'):
+            item = obj.get('item')
+            if isinstance(item, dict):
+                category = item.get('type')
+                action = _ITEM_LABELS.get(category) if isinstance(category, str) else None
+                if action:
+                    label = action + (' - zahájeno' if kind == 'item.started' else ' - dokončeno')
+        if label:
+            labels.append(label)
+    return labels[-30:]
+
+
+def project_window_alive(slot, spec):
+    """Read-only verification of a project-screen job, never an attach."""
+    if spec.get('backend') != 'project-screen' or spec.get('project_window_title') != slot.name:
+        return False
+    try:
+        import gpt2codex_queue_project as project
+        view = project.session(spec['project'], spec['cwd'])
+        if view['full_id'] != spec.get('project_session'):
+            return False
+        return any(window.endswith(':' + slot.name) for window in project.windows(view))
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
+
+
+def runtime_verified(slot, spec):
+    """Confirm server/window presence only. This cannot prove Codex progress."""
+    if spec.get('backend') == 'project-screen':
+        return project_window_alive(slot, spec)
+    if spec.get('backend', 'screen') == 'screen':
+        try:
+            identity(slot)
+            return True
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return False
+    return False
+
+
 def listing(repo):
     root = slots_root(repo)
     if not root.exists():
@@ -380,22 +514,31 @@ def listing(repo):
             spec = read(slot / 'spec.json')
             phase = read(slot / 'phase.json')
             turn_done = completed_turn(slot, phase)
-            try:
-                identity(slot)
-                screen_alive = True
-                attachable = phase.get('phase') == 'tui_starting'
-            except (OSError, RuntimeError, ValueError, KeyError):
-                screen_alive = False
-                attachable = False
-                old_phase = phase.get('phase')
-                if old_phase in ('issue_accepted', 'exec_starting', 'turn_running',
-                                 'tui_starting', 'tui_ready', 'interrupted_unknown'):
-                    if turn_done:
-                        phase = {**phase, 'last_phase': phase.get('last_phase', old_phase),
-                                 'phase': 'turn_done', 'tui_state': 'tui_closed'}
-                    else:
-                        phase = {**phase, 'last_phase': phase.get('last_phase', old_phase),
-                                 'phase': 'interrupted_unknown'}
+            if spec.get('backend') == 'project-screen':
+                # A project slot deliberately has no legacy identity.json or
+                # socket. Do not relabel a live turn as interrupted merely
+                # because the *legacy* identity check cannot succeed.
+                screen_alive = (not turn_done and phase.get('phase') in
+                                ('issue_accepted', 'exec_starting', 'turn_running')
+                                and project_window_alive(slot, spec))
+                attachable = False  # A project-screen exec is NEVER a TUI.
+            else:
+                try:
+                    identity(slot)
+                    screen_alive = True
+                    attachable = phase.get('phase') == 'tui_starting'
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    screen_alive = False
+                    attachable = False
+                    old_phase = phase.get('phase')
+                    if old_phase in ('issue_accepted', 'exec_starting', 'turn_running',
+                                     'tui_starting', 'tui_ready', 'interrupted_unknown'):
+                        if turn_done:
+                            phase = {**phase, 'last_phase': phase.get('last_phase', old_phase),
+                                     'phase': 'turn_done', 'tui_state': 'tui_closed'}
+                        else:
+                            phase = {**phase, 'last_phase': phase.get('last_phase', old_phase),
+                                     'phase': 'interrupted_unknown'}
             if attachable and phase['phase'] == 'tui_starting' and (slot / 'ready.json').exists():
                 ready = read(slot / 'ready.json')
                 if ready.get('thread_id') == phase.get('thread_id'):

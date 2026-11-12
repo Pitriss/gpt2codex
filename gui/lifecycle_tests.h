@@ -46,8 +46,14 @@ public:
 
 class GuiLifecycleTests final : public QObject {
     Q_OBJECT
-    Session live{QStringLiteral("bridge"), QStringLiteral("g2c-bridge"),
-        QStringLiteral("detached"), QStringLiteral("123.g2c-bridge"), QStringLiteral("Bridge")};
+    Session live = [] {
+        Session value{QStringLiteral("bridge"), QStringLiteral("g2c-bridge"),
+            QStringLiteral("detached"), QStringLiteral("123.g2c-bridge"), QStringLiteral("Bridge")};
+        value.programState = QStringLiteral("running");
+        value.windowNumber = QStringLiteral("0");
+        value.windowTitle = QStringLiteral("g2c-bridge");
+        return value;
+    }();
     Session missing{QStringLiteral("bridge"), QStringLiteral("g2c-bridge"),
         QStringLiteral("not_registered"), QStringLiteral("-"), QStringLiteral("Bridge")};
 
@@ -74,29 +80,153 @@ class GuiLifecycleTests final : public QObject {
         return {ticket, sequence, kind, "synthetic-turn-1", 1, phase, {}, true};
     }
 private Q_SLOTS:
+    void workerRateLimitPayloads() {
+        using namespace g2cworker;
+        const QJsonObject five{{"usedPercent", 99}, {"windowDurationMins", 300}, {"resetsAt", 1730947200}};
+        const QJsonObject week{{"usedPercent", 25}, {"windowDurationMins", 10080}, {"resetsAt", 1731950800}};
+        QJsonObject bucket{{"limitId", "codex"}, {"secondary", five}, {"primary", week}};
+        auto parsed = parseLimits({{"rateLimits", bucket}});
+        QVERIFY(parsed.five.available); QCOMPARE(parsed.five.remaining, 1);
+        QCOMPARE(parsed.five.reset, qint64(1730947200)); QCOMPARE(parsed.week.remaining, 75);
+        QCOMPARE(QDateTime::fromSecsSinceEpoch(parsed.five.reset).toUTC().date(), QDate(2024, 11, 7));
+        QJsonObject other{{"limitId", "other"}, {"primary", five}};
+        parsed = parseLimits({{"rateLimits", other}, {"rateLimitsByLimitId", QJsonObject{{"other", other}, {"codex", bucket}}}});
+        QCOMPARE(parsed.five.remaining, 1); QVERIFY(parsed.category.startsWith("codex"));
+        parsed = parseLimits({{"rateLimits", other}, {"rateLimitsByLimitId", QJsonObject{{"other", other}}}});
+        QVERIFY(!parsed.five.available); QVERIFY(parsed.reason.contains("other"));
+        QVERIFY(!parseLimits({}).five.available);
+        QVERIFY(!parseLimits({{"rateLimits", QJsonObject{{"primary", five}}}, {"rateLimitsByLimitId", QJsonObject{{"other", other}}}}).five.available);
+        bucket["primary"] = QJsonObject{{"usedPercent", 1}, {"windowDurationMins", 60}};
+        bucket["secondary"] = QJsonValue::Null;
+        parsed = parseLimits({{"rateLimits", bucket}});
+        QVERIFY(!parsed.five.available); QVERIFY(parsed.reason.contains("60 min"));
+        bucket["primary"] = QJsonObject{{"usedPercent", "99"}, {"windowDurationMins", 300}};
+        QVERIFY(!parseLimits({{"rateLimits", bucket}}).five.available);
+        bucket["primary"] = QJsonObject{{"usedPercent", 120}, {"windowDurationMins", 300}};
+        QCOMPARE(parseLimits({{"rateLimits", bucket}}).five.remaining, 0);
+        bucket["primary"] = QJsonObject{{"usedPercent", -10}, {"windowDurationMins", 300}};
+        QCOMPARE(parseLimits({{"rateLimits", bucket}}).five.remaining, 100);
+        bucket["credits"] = QJsonObject{{"balance", "12.5"}, {"hasCredits", true}, {"unlimited", false}};
+        bucket["spendControlReached"] = true;
+        parsed = parseLimits({{"rateLimits", bucket}});
+        QVERIFY(parsed.extra.contains("12.5")); QVERIFY(parsed.extra.contains("dosažen"));
+    }
+    void workerEventsRotationAndTruncation() {
+        using namespace g2cworker;
+        QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
+        const auto path = fixture.path() + "/events";
+        auto event = [](const char *name) { return QJsonDocument(QJsonObject{{"v", 1}, {"ts", 1730947200}, {"issue", 17}, {"event", name}, {"prompt", "DO NOT DISPLAY"}}).toJson(QJsonDocument::Compact) + '\n'; };
+        auto write = [&](const QByteArray &data, QIODevice::OpenMode mode = QIODevice::WriteOnly) {
+            QFile f(path); return f.open(mode) && f.write(data) == data.size();
+        };
+        EventTail tail;
+        QVERIFY(tail.read(path).isEmpty()); QVERIFY(tail.unavailable);
+        QVERIFY(write({})); QVERIFY(tail.read(path).isEmpty()); QVERIFY(!tail.unavailable);
+        auto row = event("claimed"); QVERIFY(write(row.left(10), QIODevice::Append));
+        QVERIFY(tail.read(path).isEmpty()); QVERIFY(write(row.mid(10), QIODevice::Append));
+        auto text = tail.read(path); QVERIFY(text.contains("claimed")); QVERIFY(text.contains("#17")); QVERIFY(!text.contains("DO NOT DISPLAY"));
+        QVERIFY(tail.read(path).isEmpty());
+        QVERIFY(QFile::rename(path, path + ".1")); QVERIFY(write(event("turn_started")));
+        QVERIFY(tail.read(path).contains("turn started"));
+        QVERIFY(write(event("poll"))); QVERIFY(tail.read(path).contains("poll"));
+        QVERIFY(write("{broken}\n" + event("failed"))); QVERIFY(tail.read(path).contains("FAILED"));
+        QVERIFY(eventLine(event("invented")).isEmpty());
+        QVERIFY(QFile::remove(path)); QVERIFY(::mkfifo(QFile::encodeName(path).constData(), 0600) == 0);
+        QVERIFY(tail.read(path).isEmpty()); QVERIFY(tail.unavailable); QVERIFY(QFile::remove(path));
+        QVERIFY(write(QByteArray(400000, 'x') + '\n' + event("handoff_published")));
+        text = tail.read(path); QVERIFY(text.contains("handoff published")); QVERIFY(text.size() < 200);
+    }
+    void workerReadOnlyLayoutAndStates() {
+        using namespace g2cworker;
+        QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
+        QueueWorkerPage page(fixture.path(), nullptr, false); page.resize(700, 360); page.show();
+        auto *log = page.findChild<QPlainTextEdit *>("workerLog"); QVERIFY(log && log->isReadOnly());
+        auto *five = page.findChild<QProgressBar *>("fiveHourRemaining");
+        auto *week = page.findChild<QProgressBar *>("weeklyRemaining"); QVERIFY(five && week);
+        QCOMPARE(page.findChildren<QPushButton *>().size(), 1);
+        QVERIFY(five->geometry().top() > log->geometry().bottom()); QVERIFY(week->isVisible());
+        QVERIFY(week->geometry().bottom() <= page.height());
+        QVERIFY(!five->isEnabled()); QCOMPARE(five->format(), QString("N/A"));
+        Limits limits; limits.five = {true, 1, 1730947200}; limits.week = {true, 80, 1731950800};
+        page.setLimits(limits, "synthetic"); QCOMPARE(five->value(), 1); QCOMPARE(five->format(), QString("Zbývá 1 %"));
+        QVERIFY(five->styleSheet().contains("#dc2626")); QVERIFY(five->toolTip().contains(timeText(1730947200)));
+        page.refreshFiles(); QVERIFY(page.findChild<QLabel *>("workerStatus")->text().contains("N/A"));
+        QFile state(fixture.path() + "/worker-monitor.json"); QVERIFY(state.open(QIODevice::WriteOnly));
+        state.write(R"({"v":1,"host":"fixture","backend":"screen","last_poll":1730947200,"poll_error":true,"active":{"17":{"issue":17,"event":"turn_started","backend":"screen","mode":"workspace-write"}}})"); state.close();
+        page.refreshFiles(); const auto status = page.findChild<QLabel *>("workerStatus")->text();
+        QVERIFY(status.contains("#17 turn started")); QVERIFY(status.contains("poll error"));
+        QCOMPARE(serviceState(1, "ActiveState=active\n"), QString("N/A (systemd user bus není dostupný)"));
+        QCOMPARE(serviceState(0, "LoadState=loaded\nActiveState=inactive\n"), QString("stopped"));
+        QCOMPARE(serviceState(0, "LoadState=loaded\nActiveState=active\n"), QString("running"));
+        QCOMPARE(serviceState(0, "ActiveState=failed\n"), QString("error"));
+        QCOMPARE(serviceState(0, "garbage"), QString("unknown"));
+        QFile events(fixture.path() + "/worker-events.jsonl"); QVERIFY(events.open(QIODevice::WriteOnly));
+        for (int i = 0; i < 300; ++i) { events.write("{\"v\":1,\"ts\":1730947200,\"event\":\"poll\"}\n"); } events.close();
+        page.refreshFiles(); auto *scroll = log->verticalScrollBar(); QVERIFY(scroll->maximum() > 0); scroll->setValue(20);
+        QVERIFY(events.open(QIODevice::Append)); events.write("{\"v\":1,\"ts\":1730947200,\"event\":\"failed\"}\n"); events.close();
+        page.refreshFiles(); QCOMPARE(scroll->value(), 20);
+        page.setLimits({}, "unavailable"); QVERIFY(!five->isEnabled()); QCOMPARE(five->format(), QString("N/A"));
+    }
+    void workerRpcMockReadOnly() {
+        using namespace g2cworker;
+        QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
+        const QString cli = fixture.path() + "/codex";
+        QFile f(cli); QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("#!/usr/bin/python3\nimport json,sys,pathlib\nfor line in sys.stdin:\n o=json.loads(line)\n with open(pathlib.Path(__file__).with_name('calls'),'a') as f:f.write(o['method']+'\\n')\n if o['method']=='initialize':print(json.dumps({'id':1,'result':{}}),flush=True)\n if o['method']=='account/rateLimits/read':print(json.dumps({'id':2,'result':{'rateLimits':{'primary':{'usedPercent':99,'windowDurationMins':300,'resetsAt':1730947200},'secondary':{'usedPercent':40,'windowDurationMins':10080}}}}),flush=True)\n"); f.close();
+        QVERIFY(QFile::setPermissions(cli, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+        QueueWorkerPage page(fixture.path(), nullptr, false, cli); page.refreshLimits();
+        auto *bar = page.findChild<QProgressBar *>("fiveHourRemaining");
+        QTRY_VERIFY(bar->isEnabled()); QCOMPARE(bar->value(), 1);
+        QFile calls(fixture.path() + "/calls"); QVERIFY(calls.open(QIODevice::ReadOnly));
+        QCOMPARE(calls.readAll(), QByteArray("initialize\ninitialized\naccount/rateLimits/read\n"));
+    }
+
+    void workerRpcMockUnavailable_data() {
+        QTest::addColumn<QByteArray>("response");
+        QTest::addColumn<QString>("reason");
+        QTest::newRow("missing-method") << QByteArray(R"({"id":2,"error":{"code":-32601,"message":"SECRET"}})") << QString("nepodporuje");
+        QTest::newRow("account-unavailable") << QByteArray(R"({"id":2,"error":{"code":-32000,"message":"SECRET"}})") << QString("RPC chyba");
+        QTest::newRow("no-windows") << QByteArray(R"({"id":2,"result":{"rateLimits":{}}})") << QString("kategorii codex");
+    }
+    void workerRpcMockUnavailable() {
+        using namespace g2cworker;
+        QFETCH(QByteArray, response); QFETCH(QString, reason);
+        QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
+        const QString cli = fixture.path() + "/codex";
+        QFile data(fixture.path() + "/response"); QVERIFY(data.open(QIODevice::WriteOnly)); data.write(response); data.close();
+        QFile f(cli); QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("#!/usr/bin/python3\nimport json,sys,pathlib\nfor line in sys.stdin:\n o=json.loads(line)\n if o['method']=='initialize':print('{\"id\":1,\"result\":{}}',flush=True)\n if o['method']=='account/rateLimits/read':print(pathlib.Path(__file__).with_name('response').read_text(),flush=True)\n"); f.close();
+        QVERIFY(QFile::setPermissions(cli, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+        QueueWorkerPage page(fixture.path(), nullptr, false, cli);
+        page.refreshLimits(); page.refreshLimits(); // in-flight reads are coalesced
+        auto *info = page.findChild<QLabel *>("rateLimitInfo");
+        QTRY_VERIFY(info->text().contains(reason)); QVERIFY(!info->text().contains("SECRET"));
+        auto *bar = page.findChild<QProgressBar *>("fiveHourRemaining");
+        QVERIFY(!bar->isEnabled()); QCOMPARE(bar->format(), QString("N/A"));
+    }
     void configuredProjectsAndBridgeDetached() {
         QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
         const QString base = fixture.path(), cli = base + "/bridge";
         auto write = [](const QString &path, const QByteArray &data) {
             QFile f(path); return f.open(QIODevice::WriteOnly) && f.write(data) == data.size();
         };
-        const QByteArray exact = "multiplexer=screen generation=79724035 project_id=bridge screen_name=g2c-bridge state=detached session_id=1919828.g2c-bridge task=Bridge\n";
+        const QByteArray exact = "multiplexer=screen generation=79724035 project_id=bridge screen_name=g2c-bridge state=detached session_id=1919828.g2c-bridge program=running exit_code=- exit_signal=- exited_at=- window=0 window_title=g2c-bridge task=Bridge\n";
         QList<Session> parsed; QString error;
         QVERIFY(parseSessions(exact, parsed, error));
         QCOMPARE(parsed[0].state, QString("detached"));
         QVERIFY(write(base + "/sessions", exact
-            + "multiplexer=screen generation=123 project_id=kencoder screen_name=g2c-kencoder state=detached session_id=1131254.g2c-kencoder task=KEncoder\n"
+            + "multiplexer=screen generation=123 project_id=kencoder screen_name=g2c-kencoder state=detached session_id=1131254.g2c-kencoder program=running exit_code=- exit_signal=- exited_at=- window=0 window_title=g2c-kencoder task=KEncoder\n"
             + "multiplexer=screen generation=- project_id=m365-tui screen_name=g2c-m365-tui state=not_registered session_id=- task=-\n"
             + "multiplexer=tmux generation=- project_id=bridge screen_name=g2c-bridge state=not_registered session_id=- task=-\n"
             + "multiplexer=tmux generation=- project_id=m365-tui screen_name=g2c-m365-tui state=not_registered session_id=- task=-\n"));
         QFile extra(base + "/sessions"); QVERIFY(extra.open(QIODevice::Append));
-        for (const auto &id : {"gpt2codex", "k2-smb", "reddit2tg"}) {
+        for (const auto &id : {"gpt2codex"}) {
             extra.write("multiplexer=screen generation=- project_id=" + QByteArray(id)
                 + " screen_name=g2c-" + id + " state=not_registered session_id=- task=-\n");
         }
-        for (const auto &id : {"app-memory-bar", "deb-gh"}) {
+        for (const auto &id : {"k2-smb", "reddit2tg"}) {
             extra.write("multiplexer=screen generation=444 project_id=" + QByteArray(id)
-                + " screen_name=g2c-" + id + " state=detached session_id=444.g2c-" + id + " task=Adopted\n");
+                + " screen_name=g2c-" + id + " state=detached session_id=444.g2c-" + id + " program=anchor exit_code=- exit_signal=- exited_at=- window=0 window_title=g2c-anchor task=Adopted\n");
         }
         extra.close();
         QVERIFY(write(cli, "#!/bin/sh\ncase \"$1/$2\" in\nprojects/list) echo project_dir=/synthetic; echo 'id=kencoder name=KEncoder root=/synthetic/kencoder'; echo 'id=m365-tui name=Missing root=/synthetic/m365-tui';;\nsession/list) if [ \"$4\" != --config ] || [ \"$5\" != \"$(dirname \"$0\")/config.toml\" ]; then echo 'project_id=bridge screen_name=g2c-bridge state=not_registered session_id=- task=Bridge'; else cat \"$(dirname \"$0\")/sessions\"; fi;;\n*) exit 89;;\nesac\n"));
@@ -109,30 +239,16 @@ private Q_SLOTS:
         options.queueConfig = base + "/queue.json";
         QVERIFY(write(options.queueConfig, R"({"version":1,"project_roots":{"kencoder":"/a","m365-tui":"/b","gpt2codex":"/c","k2-smb":"/d","reddit2tg":"/e"}})"));
         MemoryBackend backend; MainWindow window(options, &backend); window.show();
-        QCOMPARE(window.findChild<SessionPage *>()->session().state, QString("unknown"));
+        QCOMPARE(window.findChildren<SessionPage *>().size(), 0);
+        QCOMPARE(window.findChild<QTabWidget *>()->tabText(0), QString("Queue Worker"));
         QCOMPARE(backend.starts, 0);
-        QTRY_COMPARE(window.findChildren<SessionPage *>().size(), 6);
+        QTRY_COMPARE(window.findChildren<SessionPage *>().size(), 1);
         auto pages = window.findChildren<SessionPage *>();
-        for (auto *page : pages) {
-            QVERIFY(page->session().id != "codex-mouse-test");
-            QVERIFY(page->session().id != "app-memory-bar");
-            QVERIFY(page->session().id != "deb-gh");
-            if (page->session().id == "bridge") {
-                QCOMPARE(page->session().state, QString("detached"));
-                QVERIFY(page->findChild<QLabel *>("sessionStatus")->text().contains("detached"));
-            }
-            if (page->session().id == "m365-tui") {
-                QCOMPARE(page->session().state, QString("not_registered"));
-                QVERIFY(page->findChild<QLabel *>("sessionStatus")->text().contains("odpojen"));
-                bool explained = false;
-                for (auto *label : page->findChildren<QLabel *>()) {
-                    if (label->text().contains("--id m365-tui --multiplexer screen")) { explained = true; }
-                }
-                QVERIFY(explained);
-            }
-        }
-        QCOMPARE(backend.starts, 2); // Memory clients only; no real screen invocation.
-        QVERIFY(window.statusBar()->currentMessage().contains("2 dostupných"));
+        QCOMPARE(pages.size(), 1);
+        QCOMPARE(pages.front()->session().id, QStringLiteral("kencoder"));
+        QCOMPARE(pages.front()->session().windowTitle, QStringLiteral("g2c-kencoder"));
+        QCOMPARE(backend.starts, 1); // Memory clients only; no real screen invocation.
+        QVERIFY(window.statusBar()->currentMessage().contains("1 · anchor-only"));
         QVERIFY(window.statusBar()->currentMessage().contains(cli));
         auto refresh = [&] {
             window.statusBar()->clearMessage();
@@ -144,19 +260,17 @@ private Q_SLOTS:
         auto *problem = window.findChild<QLabel *>("queueAllowlistProblem"); QVERIFY(problem);
         QVERIFY(QFile::remove(options.queueConfig)); refresh();
         QTRY_VERIFY(problem->isVisible());
-        QTRY_VERIFY(window.statusBar()->currentMessage().contains("2 dostupných"));
-        QCOMPARE(window.findChildren<SessionPage *>().size(), 6);
-        QCOMPARE(backend.starts, 2);
+        QTRY_VERIFY(window.statusBar()->currentMessage().contains("1 · anchor-only"));
+        QCOMPARE(window.findChildren<SessionPage *>().size(), 1);
+        QCOMPARE(backend.starts, 1);
         QVERIFY(write(options.queueConfig, R"({"version":1,"project_roots":{"m365-tui":"/b"}})"));
         refresh(); QTRY_VERIFY(!problem->isVisible());
-        QTRY_VERIFY(window.statusBar()->currentMessage().contains("1 dostupných"));
+        QTRY_VERIFY(window.statusBar()->currentMessage().contains("0 · anchor-only"));
         auto *tabs = window.findChild<QTabWidget *>();
-        for (auto *page : pages) {
-            QCOMPARE(tabs->isTabVisible(tabs->indexOf(page)),
-                page->session().id == "bridge" || page->session().id == "m365-tui");
-        }
-        QCOMPARE(backend.starts, 2); // Removing permission hides presentation; no detach/kill.
-        QVERIFY(backend.last);
+        QTRY_COMPARE(window.findChildren<SessionPage *>().size(), 0);
+        QCOMPARE(tabs->count(), 2); // Only the pinned monitors remain; no empty project placeholder.
+        QCOMPARE(backend.starts, 1); // Removing permission disconnects only the view.
+        QVERIFY(backend.last.isNull());
     }
     void queueAllowlistAndExplicitConfig() {
         QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
@@ -184,44 +298,16 @@ private Q_SLOTS:
         }
     }
     void queueActiveAndHistory() {
-        QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
-        const auto base = fixture.path();
-        auto write = [](const QString &path, const QByteArray &data) {
-            QFile f(path); return f.open(QIODevice::WriteOnly) && f.write(data) == data.size();
-        };
-        const QString helper = base + "/queue.py";
-        QVERIFY(write(helper, "import pathlib,sys\nassert sys.argv[1:]==['list']\nprint(pathlib.Path(__file__).with_name('rows').read_text())\n"));
-        QVERIFY(write(base + "/gpt2codex-github-queue.py", "print('#8 done gpt2codex read-only 0123456789ab Live TUI')\nprint('#1 done gpt2codex read-only 0123456789ab Old done')\nprint('#2 rejected gpt2codex read-only 0123456789ab Old rejected')\nprint('#9 pending gpt2codex read-only 0123456789ab Waiting')\n"));
-        QVERIFY(write(base + "/rows", R"json([
-          {"slot":"q0-185c5ee8cf20","number":0,"project":"gpt2codex","phase":"interrupted_unknown","attachable":false},
-          {"slot":"q8-1282176b7c79","number":8,"project":"gpt2codex","phase":"tui_ready","thread_id":"01a1c07c-c85e-77d3-84b8-d4dd19b37394","attachable":true},
-          {"slot":"q10-0123456789ab","number":10,"project":"gpt2codex","phase":"turn_running","screen_alive":true,"attachable":false}
-        ])json"));
-        Options options; options.queueOnly = true; options.queueHelper = helper;
-        MemoryBackend backend; MainWindow window(options, &backend); window.show();
-        auto *page = window.findChild<QueuePage *>();
-        auto *list = page->findChild<QListWidget *>("queueTaskList");
-        auto *filter = page->findChild<QComboBox *>("queueTaskFilter");
-        auto visible = [list] {
-            int count = 0; for (int i = 0; i < list->count(); ++i) { if (!list->item(i)->isHidden()) { ++count; } } return count;
-        };
-        QCOMPARE(filter->currentText(), QString("Aktivní"));
-        QTRY_COMPARE(list->count(), 6); QCOMPARE(visible(), 3);
-        QVERIFY(list->item(0)->isHidden()); // q0 cannot hide/drop #8.
-        auto *selected = list->item(1); QVERIFY(!selected->isHidden());
-        list->setCurrentItem(selected);
-        QVERIFY(selected->text().contains("Queue stav: done"));
-        QVERIFY(selected->text().contains("TUI stav: tui_ready"));
-        QCOMPARE(backend.starts, 0); list->itemDoubleClicked(selected); QCOMPARE(backend.starts, 1);
-        QPointer<MemoryTerminal> terminal = backend.last;
-        filter->setCurrentIndex(1); QCOMPARE(visible(), 6); QCOMPARE(list->currentItem(), selected);
-        filter->setCurrentIndex(0); QCOMPARE(visible(), 3); QCOMPARE(list->currentItem(), selected);
-        page->findChild<QPushButton *>("queueTaskRefresh")->click();
-        QTRY_VERIFY(page->findChild<QLabel *>("queueTaskHint")->text().contains("Lokální stav"));
-        QCOMPARE(list->currentItem(), selected); QCOMPARE(backend.last, terminal); QCOMPARE(backend.starts, 1);
-        page->findChild<QPushButton *>("queueTaskDetach")->click(); QVERIFY(terminal.isNull());
-        QCOMPARE(backend.starts, 1);
-        QVERIFY(activeQueueRow(QJsonObject{{"queue_status", "approved-screen"}}));
+        QVERIFY(activeQueueRow(QJsonObject{{"queue_status", "pending"}}));
+        QVERIFY(activeQueueRow(QJsonObject{{"queue_status", "approved-project-screen"}}));
+        QVERIFY(activeQueueRow(QJsonObject{{"queue_status", "running"}}));
+        QVERIFY(activeQueueRow(QJsonObject{{"queue_status", "running"}, {"screen_alive", false}}));
+        // A legacy TUI can remain attachable after the Queue job is DONE.
+        QVERIFY(!activeQueueRow(QJsonObject{{"queue_status", "done"}, {"screen_alive", true}, {"attachable", true}}));
+        QVERIFY(!activeQueueRow(QJsonObject{{"queue_status", "failed"}, {"screen_alive", true}}));
+        QVERIFY(!activeQueueRow(QJsonObject{{"screen_alive", true}, {"attachable", true}}));
+        QVERIFY(!activeQueueRow(QJsonObject{{"queue_status", "done"}}));
+        QVERIFY(!activeQueueRow(QJsonObject{{"queue_status", "rejected"}}));
         QVERIFY(!activeQueueRow(QJsonObject{{"queue_status", "interrupted_unknown"}}));
     }
     void queueIssue9HistoricalAndPartialRows() {
@@ -253,68 +339,56 @@ private Q_SLOTS:
         parsed = parseQueueScreenRows(QJsonArray{rows[0], rows[1], rows[1]});
         QCOMPARE(parsed.rows.size(), 1); QCOMPARE(parsed.rows[0].value("number").toInt(), 0);
     }
-    void queueIssue9Ui_data() {
-        QTest::addColumn<int>("mode");
-        QTest::newRow("default-discovery") << 0;
-        QTest::newRow("explicit-helper") << 1;
-        QTest::newRow("queue-only") << 2;
-    }
-    void queueIssue9Ui() {
-        QFETCH(int, mode);
+    void queueTwoLineListAndVerifiedApproval() {
         QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
-        const auto base = fixture.path();
+        const QString base = fixture.path();
         auto write = [](const QString &path, const QByteArray &data) {
-            QFile file(path); return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(data) == data.size();
+            QFile file(path);
+            return file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                && file.write(data) == data.size();
         };
-        const QByteArray rows = R"json([
-          {"slot":"q0-185c5ee8cf20","number":0,"project":"gpt2codex","phase":"interrupted_unknown","thread_id":null,"turns_completed":0,"turns_started":0,"last_phase":"issue_accepted","attachable":false},
-          {"slot":"q8-1282176b7c79","number":8,"project":"gpt2codex","exit_code":0,"finished_at":1794230779,"phase":"tui_ready","thread_id":"01a1c07c-c85e-77d3-84b8-d4dd19b37394","tui_pid":1827407,"tui_ready":"operator_visual","turns_completed":1,"turns_started":1,"attachable":true}
-        ])json";
-        const QString helper = base + "/queue.py", cli = base + "/bridge";
-        QVERIFY(write(base + "/rows", rows));
-        QVERIFY(write(helper, "import pathlib,sys\nassert sys.argv[1:]==['list']\nprint(pathlib.Path(__file__).with_name('rows').read_text())\n"));
-        QVERIFY(write(cli, "#!/bin/sh\ncase \"$1/$2\" in\nprojects/list) echo project_dir=/synthetic;;\nsession/list) echo 'project_id=bridge screen_name=g2c-bridge state=not_registered session_id=- task=Bridge';;\n*) exit 89;;\nesac\n"));
-        QVERIFY(QFile::setPermissions(cli, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
-        Options options; QString error;
-        QStringList args{"gui"};
-        if (mode != 0) { args << "--bridge-cli" << cli << "--queue-helper" << helper; }
-        if (mode == 2) { args << "--queue-only"; }
-        QVERIFY2(parseOptions(args, options, error), qPrintable(error));
-        if (mode == 0) {
-            QVERIFY(options.queueHelper.endsWith("gpt2codex_queue_screen.py"));
-            // Keep default option parsing/discovery, substitute only I/O to
-            // avoid querying any real registry or executing a real attach.
-            options.queueHelper = helper; options.bridgeCli = cli;
-        }
+        const QString helper = base + "/queue.py";
+        const QString cli = base + "/gpt2codex-github-queue.py";
+        const QString bridge = base + "/bridge";
+        QVERIFY(write(helper, R"PY(import json,sys
+assert sys.argv[1:] == ['list']
+print('[]')
+)PY"));
+        QVERIFY(write(cli, R"PY(import sys,json,pathlib
+here = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+if args[:1] == ['--config']: args = args[2:]
+if args == ['gui-list']:
+    print(json.dumps([{'number':35,'project':'txt-proc','status':'pending','mode':'workspace-write','digest':'a'*64,'title':'Dlouhý úplný název úlohy bez zkracování'}]))
+elif args == ['gui-detail','35']:
+    print(json.dumps({'number':35,'project':'txt-proc','status':'pending','mode':'workspace-write','digest':'a'*64,'remote_state':'open','title':'Dlouhý úplný název úlohy bez zkracování','task':'Úplné zadání\nDruhý odstavec.'}))
+elif args[:2] == ['gui-approve','35']:
+    assert args[2:] == ['--digest','a'*64,'--confirmation','SCHVALUJI 35']
+    (here/'approved').write_text('yes')
+    print('APPROVED #35')
+else: sys.exit(88)
+)PY"));
+        QVERIFY(write(bridge, "#!/bin/sh\ncase \"$1/$2\" in\nprojects/list) echo project_dir=/synthetic;;\nsession/list) echo 'project_id=bridge screen_name=g2c-bridge state=not_registered session_id=- task=Bridge';;\n*) exit 88;;\nesac\n"));
+        QVERIFY(QFile::setPermissions(bridge, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+        Options options;
+        options.bridgeCli = bridge; options.queueHelper = helper; options.queueOnly = true;
         MemoryBackend backend;
         MainWindow window(options, &backend); window.show();
         auto *page = window.findChild<QueuePage *>(); QVERIFY(page);
-        auto *list = page->findChild<QListWidget *>("queueTaskList");
-        auto *open = page->findChild<QPushButton *>("queueTaskOpen");
-        auto *refresh = page->findChild<QPushButton *>("queueTaskRefresh");
-        auto *hint = page->findChild<QLabel *>("queueTaskHint");
-        auto *tabs = window.findChild<QTabWidget *>(); tabs->setCurrentWidget(page);
-        QTRY_COMPARE(list->count(), 2);
-        list->setCurrentRow(0); QVERIFY(!open->isEnabled());
-        QVERIFY(list->currentItem()->text().contains("interrupted_unknown"));
-        list->setCurrentRow(1); QVERIFY(open->isEnabled());
-        QVERIFY(page->findChild<QLabel *>("queueTaskDetail")->text().contains("01a1c07c-c85e-77d3-84b8-d4dd19b37394"));
-        auto *selected = list->currentItem();
-        list->itemDoubleClicked(selected);
-        QCOMPARE(backend.arguments, QStringList({options.queueHelper, "attach", "q8-1282176b7c79"}));
-        QCOMPARE(backend.starts, 1);
-        QPointer<MemoryTerminal> terminal = backend.last;
-        if (mode != 2) { tabs->setCurrentIndex(0); tabs->setCurrentWidget(page); }
-        // Duplicate historical row must not block #8 or disturb its terminal.
-        auto array = QJsonDocument::fromJson(rows).array(); array.append(array[0]);
-        QVERIFY(write(base + "/rows", QJsonDocument(array).toJson())); refresh->click();
-        QTRY_VERIFY(hint->text().contains("duplicitní"));
-        QCOMPARE(list->count(), 1); QCOMPARE(list->currentItem(), selected);
-        QCOMPARE(backend.last, terminal); QCOMPARE(backend.starts, 1);
-        QVERIFY(write(base + "/rows", rows)); refresh->click();
-        QTRY_COMPARE(list->count(), 2); QCOMPARE(list->currentItem(), selected);
-        QCOMPARE(backend.last, terminal); QCOMPARE(backend.starts, 1);
-        QVERIFY(!open->isEnabled()); // Already attached; no second client/turn.
+        auto *list = page->findChild<QListWidget *>("queueTaskList"); QVERIFY(list);
+        QTRY_COMPARE(list->count(), 1);
+        QCOMPARE(list->item(0)->text(), QString::fromUtf8("#35    txt-proc    pending\nDlouhý úplný název úlohy bez zkracování"));
+        list->setCurrentRow(0);
+        auto *body = page->findChild<QPlainTextEdit *>("queueTaskBody"); QVERIFY(body);
+        auto *approval = page->findChild<QCheckBox *>("queueTaskApproval"); QVERIFY(approval);
+        auto *confirm = page->findChild<QPushButton *>("queueTaskConfirm"); QVERIFY(confirm);
+        QTRY_COMPARE(body->toPlainText(), QString::fromUtf8("Úplné zadání\nDruhý odstavec."));
+        QVERIFY(approval->isEnabled()); QVERIFY(!confirm->isEnabled());
+        approval->setChecked(true);
+        QVERIFY(confirm->isEnabled());
+        confirm->click();
+        QTRY_VERIFY(QFileInfo::exists(base + "/approved"));
+        QCOMPARE(backend.starts, 0); // Local GUI approval never launches/attaches Codex.
     }
     void queueDefaultsAndOverrides() {
         Options options; QString error;
@@ -322,111 +396,63 @@ private Q_SLOTS:
         QVERIFY(QFileInfo(options.bridgeCli).isExecutable());
         QVERIFY(options.queueHelper.endsWith("gpt2codex_queue_screen.py"));
         QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
-        const QString helper = fixture.path() + "/custom-helper.py";
+        const QString helper = fixture.path() + "/gpt2codex_queue_screen.py";
+        const QString queue = fixture.path() + "/gpt2codex-github-queue.py";
         QFile file(helper); QVERIFY(file.open(QIODevice::WriteOnly)); file.close();
+        QFile cliFile(queue); QVERIFY(cliFile.open(QIODevice::WriteOnly)); cliFile.close();
         Options overrideOptions;
         QVERIFY(parseOptions({"gui", "--bridge-cli", options.bridgeCli,
             "--queue-helper", helper, "--queue-only"}, overrideOptions, error));
         QCOMPARE(overrideOptions.queueHelper, QFileInfo(helper).canonicalFilePath());
         QCOMPARE(overrideOptions.bridgeCli, options.bridgeCli);
         QVERIFY(overrideOptions.queueOnly);
+        Options wrongHelper;
+        QVERIFY(!parseOptions({"gui", "--queue-helper", queue, "--queue-only"}, wrongHelper, error));
+        QVERIFY(error.contains("gpt2codex_queue_screen.py"));
+        const QString checkout = fixture.path() + "/checkout";
+        QVERIFY(QDir().mkpath(checkout + "/.tmp"));
+        QVERIFY(QDir().mkpath(checkout + "/.log"));
+        const QString config = fixture.path() + "/queue.json";
+        const auto bytes = QJsonDocument(QJsonObject{{"version", 1},
+            {"project_roots", QJsonObject{{"gpt2codex", checkout}}}}).toJson();
+        QFile configFile(config); QVERIFY(configFile.open(QIODevice::WriteOnly));
+        QCOMPARE(configFile.write(bytes), qint64(bytes.size())); configFile.close();
+        Options installedOptions;
+        QVERIFY2(parseOptions({"gui", "--queue-helper", helper, "--queue-config", config,
+            "--queue-only"}, installedOptions, error), qPrintable(error));
+        QCOMPARE(installedOptions.queueRepoRoot, QFileInfo(checkout).canonicalFilePath());
+        QVERIFY(installedOptions.queueRootError.isEmpty());
         Options duplicate;
         QVERIFY(!parseOptions({"gui", "--bridge-cli", options.bridgeCli, "--queue-only", "--queue-only"}, duplicate, error));
     }
-    void queueOnlyListsAndOpensExactTaskWithoutBridge() {
-        QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
-        const QString helper = fixture.path() + QStringLiteral("/queue.py");
-        QFile file(helper); QVERIFY(file.open(QIODevice::WriteOnly));
-        file.write("import json,sys\nassert sys.argv[1:]==['list']\nprint(json.dumps([{'slot':'q7-0123456789ab','number':7,'project':'gpt2codex','phase':'tui_starting','thread_id':'0199a213-81c0-7800-8aa1-bbab2a035a53','turns_started':1,'turns_completed':1,'attachable':True}]))\n");
-        file.close();
-        Options options; options.bridgeCli = QStringLiteral("/nonexistent-must-never-run");
-        options.queueHelper = helper; options.queueOnly = true;
-        MemoryBackend backend;
-        MainWindow window(options, &backend);
-        window.show();
-        QTRY_VERIFY(window.findChild<QListWidget *>(QStringLiteral("queueTaskList")));
-        auto *list = window.findChild<QListWidget *>(QStringLiteral("queueTaskList"));
-        QTRY_COMPARE(list->count(), 1);
-        QCOMPARE(backend.starts, 0);
-        QCOMPARE(window.findChild<QTabWidget *>()->count(), 1);
-        QVERIFY(list->item(0)->text().contains(QStringLiteral("tui_starting")));
-        QVERIFY(window.findChild<QSplitter *>());
-        list->setCurrentRow(0);
-        auto *open = window.findChild<QPushButton *>(QStringLiteral("queueTaskOpen")); QVERIFY(open);
-        open->click();
-        QCOMPARE(backend.starts, 1);
-        QCOMPARE(backend.arguments, QStringList({helper, QStringLiteral("attach"), QStringLiteral("q7-0123456789ab")}));
-        backend.last->finish();
-        QCoreApplication::processEvents();
-        QCOMPARE(backend.starts, 1); // Never restart/replay on terminal exit.
-    }
-    void queueTabRefreshSelectionGuardsAndClientLifecycle() {
+    void queueInvalidDetailCannotApproveOrAttach() {
         QTemporaryDir fixture(fixtureTemplate()); QVERIFY(fixture.isValid());
         const QString base = fixture.path();
         auto write = [](const QString &path, const QByteArray &data) {
-            QFile file(path); return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(data) == data.size();
+            QFile file(path);
+            return file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                && file.write(data) == data.size();
         };
-        const QString helper = base + "/queue.py";
-        QVERIFY(write(helper, "import pathlib,sys\nassert sys.argv[1:]==['list']\nprint(pathlib.Path(__file__).with_name('rows').read_text())\n"));
-        QVERIFY(write(base + "/gpt2codex-github-queue.py",
-            "import sys\nassert sys.argv[1:]==['list']\nprint('#7 completed     gpt2codex     read-only       0123456789ab Completed title')\nprint('#9 pending       gpt2codex     workspace-write 0123456789ab Awaiting approval')\n"));
-        QByteArray rows = "[{\"slot\":\"q7-0123456789ab\",\"number\":7,\"project\":\"gpt2codex\",\"phase\":\"tui_ready\",\"thread_id\":\"uuid-fixture\",\"attachable\":true},"
-            "{\"slot\":\"q8-abcdef012345\",\"number\":8,\"project\":\"gpt2codex\",\"phase\":\"turn_running\",\"attachable\":true}]";
-        QVERIFY(write(base + "/rows", rows));
-        const QString cli = base + "/bridge";
-        QVERIFY(write(cli, "#!/bin/sh\ncase \"$1/$2\" in\nprojects/list) echo project_dir=/synthetic;;\nsession/list) echo 'project_id=bridge screen_name=g2c-bridge state=not_registered session_id=- task=Bridge';;\n*) exit 89;;\nesac\n"));
-        QVERIFY(QFile::setPermissions(cli, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
-        Options options; options.bridgeCli = cli; options.queueHelper = helper;
-        MemoryBackend backend;
-        QPointer<MemoryTerminal> closing;
-        {
-            MainWindow window(options, &backend); window.show();
-            auto *tabs = window.findChild<QTabWidget *>();
-            auto *page = window.findChild<QueuePage *>(); QVERIFY(page);
-            QCOMPARE(tabs->count(), 2);
-            QCOMPARE(tabs->tabText(tabs->indexOf(page)), QStringLiteral("GitHub Queue"));
-            QVERIFY(!tabs->tabBar()->tabButton(tabs->indexOf(page), QTabBar::RightSide));
-            auto *list = page->findChild<QListWidget *>("queueTaskList");
-            auto *open = page->findChild<QPushButton *>("queueTaskOpen");
-            auto *refresh = page->findChild<QPushButton *>("queueTaskRefresh");
-            auto *detach = page->findChild<QPushButton *>("queueTaskDetach");
-            QTRY_COMPARE(list->count(), 3);
-            QVERIFY(list->item(0)->text().contains("Completed title"));
-            list->setCurrentRow(2); QVERIFY(!open->isEnabled()); // Pending remains selectable.
-            QVERIFY(page->findChild<QLabel *>("queueTaskDetail")->text().contains("pending"));
-            list->setCurrentRow(1); QVERIFY(!open->isEnabled()); // Even a lying attachable flag cannot attach turn_running.
-            open->click(); QCOMPARE(backend.starts, 0);
-            list->setCurrentRow(0); QVERIFY(open->isEnabled());
-            auto *const selected = list->currentItem();
-            tabs->setCurrentWidget(page);
-            // Actual double-click signal path opens precisely the selected slot.
-            list->itemDoubleClicked(selected);
-            QCOMPARE(backend.starts, 1);
-            QCOMPARE(backend.arguments, QStringList({helper, "attach", "q7-0123456789ab"}));
-            QPointer<MemoryTerminal> original = backend.last;
-            QGuiApplication::clipboard()->setText("fixture paste");
-            original->setFocus();
-            QTest::keyClick(original, Qt::Key_V, Qt::ControlModifier | Qt::ShiftModifier);
-            QTest::keyClick(original, Qt::Key_Insert, Qt::ShiftModifier);
-            QCOMPARE(original->pastes, 2);
-            tabs->setCurrentIndex(0); tabs->setCurrentWidget(page);
-            QCOMPARE(backend.starts, 1); QCOMPARE(backend.last, original);
-            rows.replace("tui_ready", "tui_starting"); QVERIFY(write(base + "/rows", rows));
-            refresh->click(); refresh->click(); // One metadata request in flight.
-            QTRY_VERIFY(selected->text().contains("tui_starting"));
-            QCOMPARE(list->currentItem(), selected); QCOMPARE(list->count(), 3);
-            QCOMPARE(backend.last, original); QCOMPARE(backend.starts, 1);
-            detach->click(); QVERIFY(original.isNull()); QCOMPARE(backend.starts, 1);
-            open->click(); QCOMPARE(backend.starts, 2);
-            backend.last->finish(); QCoreApplication::processEvents();
-            QCOMPARE(backend.starts, 2); QVERIFY(!detach->isEnabled());
-            open->click(); QCOMPARE(backend.starts, 3); closing = backend.last;
-            // Metadata failures retain selection, block new attach, and keep the TUI.
-            QVERIFY(write(base + "/rows", "invalid json")); refresh->click();
-            QTRY_VERIFY(!open->isEnabled());
-            QCOMPARE(backend.last, closing); QCOMPARE(list->currentItem(), selected);
-        }
-        QVERIFY(closing.isNull()); // GUI destruction destroys only its client widget.
+        QVERIFY(write(base + "/queue.py", "print('[]')\n"));
+        QVERIFY(write(base + "/gpt2codex-github-queue.py", R"PY(import sys,json
+args = sys.argv[1:]
+if args[:1] == ['--config']: args = args[2:]
+if args == ['gui-list']:
+    print(json.dumps([{'number':35,'project':'txt-proc','status':'pending','mode':'workspace-write','title':'Test'}]))
+else: sys.exit(2)
+)PY"));
+        Options options; options.queueOnly = true; options.queueHelper = base + "/queue.py";
+        MemoryBackend backend; MainWindow window(options, &backend); window.show();
+        auto *page = window.findChild<QueuePage *>(); QVERIFY(page);
+        auto *list = page->findChild<QListWidget *>("queueTaskList"); QVERIFY(list);
+        QTRY_COMPARE(list->count(), 1);
+        list->setCurrentRow(0);
+        auto *approval = page->findChild<QCheckBox *>("queueTaskApproval"); QVERIFY(approval);
+        auto *confirm = page->findChild<QPushButton *>("queueTaskConfirm"); QVERIFY(confirm);
+        auto *body = page->findChild<QPlainTextEdit *>("queueTaskBody"); QVERIFY(body);
+        QTRY_VERIFY(body->toPlainText().contains("nepodařilo ověřit"));
+        QVERIFY(!approval->isEnabled()); QVERIFY(!confirm->isEnabled());
+        QCOMPARE(backend.starts, 0);
     }
     void markerHelperAndWatcherThreeSessions() {
         using namespace g2cattention;
@@ -844,7 +870,11 @@ private Q_SLOTS:
             source.setBinding(id, attentionRun());
             listing += "multiplexer=" + id.multiplexer.toUtf8() + " generation=" + id.generation.toUtf8()
                 + " project_id=" + id.project.toUtf8() + " screen_name=g2c-" + id.project.toUtf8()
-                + " state=detached session_id=" + id.sessionId.toUtf8() + " task=Original\n";
+                + " state=detached session_id=" + id.sessionId.toUtf8()
+                + (id.multiplexer == "screen"
+                    ? " program=running exit_code=- exit_signal=- exited_at=- window=0 window_title=g2c-" + id.project.toUtf8()
+                    : " program=running exit_code=- exit_signal=- exited_at=- window=- window_title=-")
+                + " task=Original\n";
         }
         QVERIFY(write(base + "/sessions", listing));
         const QString cli = base + "/fixture-cli";
@@ -1085,7 +1115,7 @@ private Q_SLOTS:
         BackendRegistry registry(backend);
         QTabWidget tabs;
         Session screen = live;
-        screen.id = "demo"; screen.screenName = "g2c-demo"; screen.sessionId = "123.g2c-demo";
+        screen.id = "demo"; screen.screenName = "g2c-demo"; screen.sessionId = "123.g2c-demo"; screen.windowTitle = "g2c-demo";
         Session tmux = screen;
         tmux.multiplexer = "tmux"; tmux.sessionId = "321.$0.123456";
         auto *first = new SessionPage({}, registry, "konsole", screen, &tabs);
@@ -1143,9 +1173,9 @@ private Q_SLOTS:
         QVERIFY(write(base + "/roots", roots));
         const QByteArray listing =
             "multiplexer=screen generation=- project_id=bridge screen_name=g2c-bridge state=not_registered session_id=- task=Bridge\n"
-            "multiplexer=screen generation=123 project_id=demo screen_name=g2c-demo state=interrupted session_id=123.g2c-demo task=Original\n"
-            "multiplexer=tmux generation=456 project_id=demo screen_name=g2c-demo state=interrupted session_id=321.$0.123456 task=Original\n"
-            "multiplexer=screen generation=789 project_id=other screen_name=g2c-other state=interrupted session_id=789.g2c-other task=Other\n";
+            "multiplexer=screen generation=123 project_id=demo screen_name=g2c-demo state=detached session_id=123.g2c-demo program=running exit_code=- exit_signal=- exited_at=- window=0 window_title=g2c-demo task=Original\n"
+            "multiplexer=tmux generation=456 project_id=demo screen_name=g2c-demo state=detached session_id=321.$0.123456 program=running exit_code=- exit_signal=- exited_at=- window=- window_title=- task=Original\n"
+            "multiplexer=screen generation=789 project_id=other screen_name=g2c-other state=detached session_id=789.g2c-other program=running exit_code=- exit_signal=- exited_at=- window=0 window_title=g2c-other task=Other\n";
         QVERIFY(write(base + "/sessions", listing));
         const QString cli = base + "/fixture-cli";
         QVERIFY(write(cli, "#!/bin/sh\nbase=${0%/*}\nprintf '%s/%s\\n' \"$1\" \"$2\" >> \"$base/calls\"\ncase \"$1/$2\" in\nprojects/list) /bin/cat \"$base/roots\";;\nsession/list) /bin/cat \"$base/sessions\";;\nsession/prefer) printf 'project_id=demo preferred=tmux\\n';;\n*) exit 89;;\nesac\n"));
@@ -1157,17 +1187,20 @@ private Q_SLOTS:
         const QString queueConfig = base + "/queue.json";
         QVERIFY(write(queueConfig, QJsonDocument(QJsonObject{{"version", 1}, {"project_roots", queueRoots}}).toJson(QJsonDocument::Compact)));
         Options options; options.bridgeCli = cli; options.config = base + "/fixture-config"; options.queueConfig = queueConfig;
-        MainWindow window(options);
+        MemoryBackend backend;
+        MainWindow window(options, &backend);
         auto *tabs = window.findChild<QTabWidget *>();
         QVERIFY(tabs);
         QTRY_COMPARE(tabs->count(), 5);
+        QTRY_COMPARE(backend.starts, 3); // Active fixtures use the in-memory terminal; never invoke real attach.
+        QCOMPARE(backend.creates, 3);
         QTRY_VERIFY(tabs->tabToolTip(1).contains(base + "/repos/demo"));
         auto *screen = qobject_cast<SessionPage *>(tabs->widget(1));
         auto *tmux = qobject_cast<SessionPage *>(tabs->widget(2));
         auto *other = qobject_cast<SessionPage *>(tabs->widget(3));
         QVERIFY(screen && tmux && other);
         const QString originalId = screen->session().sessionId;
-        QCOMPARE(tabs->tabIcon(0).pixmap(g2ctabs::decorationSize()).toImage().pixelColor(10, 10), QColor(Qt::blue));
+        QCOMPARE(tabs->tabText(0), QString("Queue Worker"));
         QVERIFY(!tabs->tabBar()->tabButton(0, QTabBar::RightSide));
         auto checkPage = [&](SessionPage *page, const QString &root, const QColor &color) {
             const int index = tabs->indexOf(page);
@@ -1199,6 +1232,7 @@ private Q_SLOTS:
         QTRY_COMPARE(screen->session().task, QStringLiteral("Refreshed"));
         QCOMPARE(screen->session().sessionId, originalId);
         QCOMPARE(screen->session().multiplexer, QStringLiteral("screen"));
+        QCOMPARE(backend.starts, 3);
         QVERIFY(checkPage(screen, base + "/repos/demo", Qt::red));
         QVERIFY(checkPage(tmux, base + "/repos/demo", Qt::red));
         QVERIFY(checkPage(other, base + "/repos/other", Qt::green));
@@ -1223,6 +1257,24 @@ private Q_SLOTS:
             QVERIFY(line.isEmpty() || line == "projects/list" || line == "session/list" || line == "session/prefer");
         }
     }
+    void screenAnchorIsNotACodexAndManualWindowIsExact() {
+        QList<Session> parsed; QString error;
+        const QByteArray bridge = "multiplexer=screen generation=- project_id=bridge screen_name=g2c-bridge state=not_registered session_id=- task=Bridge\n";
+        const QByteArray anchor = "multiplexer=screen generation=123 project_id=demo screen_name=g2c-demo state=attached session_id=123.g2c-demo program=anchor exit_code=- exit_signal=- exited_at=- window=0 window_title=g2c-anchor task=Codex\n" + bridge;
+        QVERIFY(parseSessions(anchor, parsed, error));
+        QVERIFY(!parsed[0].hasCodexView());
+        QCOMPARE(parsed[0].windowTitle, QStringLiteral("g2c-anchor"));
+        parsed.clear();
+        const QByteArray manual = "multiplexer=screen generation=123 project_id=demo screen_name=g2c-demo state=attached session_id=123.g2c-demo program=running exit_code=- exit_signal=- exited_at=- window=2 window_title=g2c-demo task=Codex\n" + bridge;
+        QVERIFY(parseSessions(manual, parsed, error));
+        QVERIFY(parsed[0].hasCodexView());
+        QCOMPARE(attachArguments({}, parsed[0]), QStringList({"session", "attach", "--multiplexer", "screen",
+            "--expect-session-id", "123.g2c-demo", "--expect-process-start-ticks", "123",
+            "--id", "demo", "--window", "2"}));
+        parsed.clear();
+        QVERIFY(!parseSessions(QByteArray(manual).replace("window_title=g2c-demo", "window_title=g2c-anchor"), parsed, error));
+    }
+
     void exitedProgramKeepsVerifiedTerminal() {
         const QByteArray listing = "multiplexer=tmux generation=456 project_id=bridge screen_name=g2c-bridge state=detached session_id=321.$0.123456 program=exited exit_code=23 exit_signal=- exited_at=123457 task=Bridge\n";
         QList<Session> parsed;
@@ -1254,7 +1306,7 @@ private Q_SLOTS:
         page.update(live);
         QCOMPARE(backend.starts, 1);
         QCOMPARE(backend.arguments, QStringList({"session", "attach", "--multiplexer", "screen",
-            "--expect-session-id", "123.g2c-bridge", "--bridge"}));
+            "--expect-session-id", "123.g2c-bridge", "--bridge", "--window", "0"}));
         for (int i = 0; i < 5; ++i) { page.update(live); page.activateTerminal(); }
         QCOMPARE(backend.starts, 1);
     }

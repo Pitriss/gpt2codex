@@ -8,6 +8,11 @@ opt-in per private config and is deliberately single-job, not a concurrent
 project dispatcher. It is not a substitute for the unfinished Rust supervisor.
 """
 import os
+import contextlib
+import fcntl
+import hashlib
+import json
+import shutil
 from pathlib import Path
 import pwd
 import re
@@ -33,6 +38,107 @@ class ProjectScreenError(RuntimeError):
 def require(condition, reason):
     if not condition:
         raise ProjectScreenError(reason)
+
+
+def registry_config(cfg):
+    base = os.environ.get('XDG_CONFIG_HOME', '')
+    default = (Path(base) if Path(base).is_absolute() else Path.home() / '.config')
+    path = Path(cfg.get('registry_config', default / 'chatgpt2codex/config.toml'))
+    require(path.is_absolute(), 'Rust registry config must be absolute')
+    return path
+
+
+def descriptor_stamp(stream):
+    before = os.fstat(stream.fileno())
+    require(stat.S_ISREG(before.st_mode), 'Executable must be a regular file')
+    stream.seek(0)
+    digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    after = os.fstat(stream.fileno())
+    require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) ==
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns),
+            'Executable changed during validation')
+    return [after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, digest]
+
+
+@contextlib.contextmanager
+def pinned_executable(path, expected=None):
+    path = Path(path)
+    require(path.is_absolute() and os.access(path, os.X_OK), 'Verified executable unavailable')
+    with path.open('rb') as stream:
+        stamp = descriptor_stamp(stream)
+        require(expected is None or stamp == expected, 'Executable changed since preclaim; no retry')
+        # Execute the verified descriptor, never reopen a checked pathname.
+        yield {'executable': '/proc/self/fd/' + str(stream.fileno()),
+               'pass_fds': (stream.fileno(),)}
+
+
+def executable_stamp(path):
+    require(Path(path).is_absolute() and os.access(path, os.X_OK), 'Verified executable unavailable')
+    with Path(path).open('rb') as stream:
+        return descriptor_stamp(stream)
+
+
+def registered_metadata(cli, config, project, root, expected=None):
+    with pinned_executable(cli, expected) as pinned:
+        completed = subprocess.run([cli, 'project', 'metadata', '--config', str(config), '--id', project],
+                               env=slots.clean_env(), stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=10, check=False, **pinned)
+    require(completed.returncode == 0 and len(completed.stdout) <= 4096,
+            'Rust project metadata unavailable; update the bridge CLI')
+    try:
+        value = json.loads(completed.stdout)
+    except (ValueError, UnicodeError):
+        raise ProjectScreenError('Invalid Rust project metadata') from None
+    require(isinstance(value, dict) and set(value) == {'id', 'root', 'type'}
+            and value['id'] == project and value['root'] == str(Path(root).resolve(strict=True))
+            and value['type'] in ('standard', 'non-git'),
+            'Rust registry type/root mismatch')
+    return value
+
+
+@contextlib.contextmanager
+def registry_lease(config):
+    # Same directory lock as Rust preference/upgrade transactions. Shared leases
+    # permit different projects; upgrades cannot race an admitted Queue turn.
+    directory = Path(config).parent / 'projects'
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        require(info.st_uid == os.getuid(), 'Foreign registry directory')
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def preclaim(cfg, project, root, codex):
+    cli = cfg.get('bridge_cli') or shutil.which('gpt2codex')
+    require(isinstance(cli, str) and Path(cli).is_absolute(),
+            'Rust bridge CLI unavailable; set bridge_cli')
+    config = registry_config(cfg)
+    proof = {'cli': cli, 'config': str(config), 'codex': str(codex),
+             'cli_stamp': executable_stamp(cli), 'codex_stamp': executable_stamp(codex)}
+    proof['metadata'] = registered_metadata(cli, config, project, root, proof['cli_stamp'])
+    if proof['metadata']['type'] == 'non-git':
+        with pinned_executable(codex, proof['codex_stamp']) as pinned:
+            completed = subprocess.run([str(codex), 'exec', '--help'], env=slots.clean_env(),
+                                       stdin=subprocess.DEVNULL, capture_output=True, timeout=10, **pinned)
+        require(completed.returncode == 0 and len(completed.stdout) <= 262144
+                and re.search(rb'(?<![\w-])--skip-git-repo-check(?![\w-])', completed.stdout),
+                'Non-git requires codex exec --skip-git-repo-check support; approval not claimed')
+    validate_start(proof, project, root, codex)
+    return proof
+
+
+def validate_start(proof, project, root, codex):
+    require(isinstance(proof, dict) and proof.get('codex') == str(codex),
+            'Missing immutable preclaim validation')
+    require(executable_stamp(proof['cli']) == proof['cli_stamp']
+            and executable_stamp(codex) == proof['codex_stamp'],
+            'Executable changed since preclaim; no retry')
+    require(registered_metadata(proof['cli'], proof['config'], project, root, proof['cli_stamp']) == proof['metadata'],
+            'Rust registry changed since preclaim; no retry')
+    return proof['metadata']['type']
 
 
 def _proc_stat(pid):
@@ -241,10 +347,68 @@ def anchor_ready(store, project, root, *, idle=True):
     return view, record
 
 
-def _no_external_codex(root):
-    """Best-effort managed-process admission, never an arbitrary kill API."""
+def _is_verified_app_server_daemon(proc, daemon_dir):
+    """Ignore ONLY a recorded Codex App Server daemon/updater, never a TUI.
+
+    PID files alone are insufficient: a stale PID could identify an unrelated
+    Codex process. Require a private owned directory, a regular PID record,
+    daemon stdio, and the exact open stderr log inode before exempting it.
+    Any missing/ambiguous evidence is fail-closed (the process stays busy).
+    """
+    import json
+
+    daemon_dir = Path(daemon_dir)
+    try:
+        st = daemon_dir.lstat()
+        # Codex creates PID/log files with the caller's umask (commonly 0664).
+        # A strictly private 0700 directory prevents group/other access to them.
+        if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
+                or st.st_mode & 0o077):
+            return False
+        if (os.readlink(proc / 'fd' / '0') != '/dev/null'
+                or os.readlink(proc / 'fd' / '1') != '/dev/null'):
+            return False
+        stderr_name = os.readlink(proc / 'fd' / '2')
+    except (OSError, ValueError):
+        return False
+
+    for name, log_name in (('daemon', 'daemon.stderr.log'),
+                           ('daemon-updater', 'daemon-updater.stderr.log')):
+        record = daemon_dir / (name + '.pid')
+        logfile = daemon_dir / log_name
+        try:
+            info = record.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1
+                    or not 0 < info.st_size <= 4096):
+                continue
+            data = json.loads(record.read_text(encoding='utf-8'))
+            if (not isinstance(data, dict) or type(data.get('pid')) is not int
+                    or data['pid'] != int(proc.name) or stderr_name != str(logfile)):
+                continue
+            log_info = logfile.lstat()
+            fd_info = (proc / 'fd' / '2').stat()
+            if (stat.S_ISREG(log_info.st_mode) and log_info.st_uid == os.getuid()
+                    and (log_info.st_dev, log_info.st_ino)
+                    == (fd_info.st_dev, fd_info.st_ino)):
+                return True
+        except (OSError, ValueError, UnicodeError):
+            continue
+    return False
+
+
+def _no_external_codex(root, *, proc_root=None, daemon_directory=None):
+    """Best-effort managed-process admission, never an arbitrary kill API.
+
+    proc_root/daemon_directory injection is for isolated regression tests only.
+    The live path always inspects the host's /proc and the user's PID records.
+    """
     base = Path(root)
-    for proc in Path('/proc').iterdir():
+    if proc_root is None:
+        proc_root = Path('/proc')
+    if daemon_directory is None:
+        daemon_directory = Path.home() / '.codex' / 'app-server-daemon'
+    for proc in Path(proc_root).iterdir():
         if not proc.name.isdigit():
             continue
         try:
@@ -255,6 +419,8 @@ def _no_external_codex(root):
                 continue
             cwd = Path(os.readlink(proc / 'cwd'))
             if cwd == base or base in cwd.parents:
+                if _is_verified_app_server_daemon(proc, daemon_directory):
+                    continue
                 raise ProjectScreenError('project_busy: Codex already running in workspace')
         except (FileNotFoundError, ProcessLookupError):
             continue
@@ -267,6 +433,8 @@ def launch(store, item, codex, root, prompt, env=None):
     if env and any(k.startswith('G2C_PROJECT_SUPERVISOR') for k in env):
         raise ProjectScreenError('Supervisor STOP gate set; project canary forbidden')
     slots.require_legacy_launch_allowed(env)
+    proof = item.get("_project_validation")
+    validate_start(proof, item["project"], root, codex)
     view, anchor = anchor_ready(store, item['project'], root)
     slots.require_chatgpt(codex, slots.clean_env())
     # A second check immediately before launch prevents the common manual race.

@@ -73,6 +73,12 @@ fn is_screen(value: &crate::multiplexer::Multiplexer) -> bool {
 #[derive(Debug, Clone)]
 struct LiveSession { full_id: String, pid: u32, name: String, state: &'static str }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Window {
+    pub number: u32,
+    pub title: String,
+}
+
 pub struct Status {
     pub project_id: String,
     pub screen_name: String,
@@ -158,6 +164,44 @@ fn current_sessions() -> Result<Vec<LiveSession>> {
     }
     Ok(parse_sessions(&output))
 }
+
+fn parse_windows(output: &str) -> Result<Vec<Window>> {
+    let mut windows = Vec::new();
+    let mut numbers = std::collections::HashSet::new();
+    for field in output.split_whitespace() {
+        let (number, title) = field.split_once(':').ok_or_else(|| err("invalid GNU screen window inventory"))?;
+        if number.is_empty() || number.len() > 2 || !number.bytes().all(|b| b.is_ascii_digit())
+            || title.is_empty() || title.len() > 80
+            || !title.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            return Err(err("invalid GNU screen window identity"));
+        }
+        let number: u32 = number.parse().map_err(|_| err("invalid GNU screen window number"))?;
+        if number > 99 || !numbers.insert(number) || windows.len() >= 32 {
+            return Err(err("ambiguous GNU screen window inventory"));
+        }
+        windows.push(Window { number, title: title.to_owned() });
+    }
+    if windows.is_empty() { return Err(err("GNU screen returned no managed windows")); }
+    Ok(windows)
+}
+
+/// Read-only inventory bound to the registered screen PID/full ID. No window
+/// selection, attach, input, rename or other screen mutation is performed.
+pub(crate) fn windows_for_status(config: &Path, target: Target<'_>, expected: &Status) -> Result<Vec<Window>> {
+    if !matches!(expected.state, "attached" | "detached") {
+        return Err(err("managed screen is not running; window inventory unavailable"));
+    }
+    let full = expected.full_id.as_deref().ok_or_else(|| err("managed screen ID missing"))?;
+    let output = bounded_screen_output(&["-S", full, "-Q", "windows", "%n:%t "])?;
+    let parsed = parse_windows(&output)?;
+    let after = status(config, target)?;
+    if expected.full_id.as_deref() != after.full_id.as_deref() || expected.process_start_ticks != after.process_start_ticks
+        || !matches!(after.state, "attached" | "detached") {
+        return Err(err("managed screen identity changed during window inventory"));
+    }
+    Ok(parsed)
+}
+
 
 fn euid() -> u32 { unsafe { libc::geteuid() } }
 
@@ -524,19 +568,33 @@ fn start_impl(config: &Path, target: Target<'_>, task: &str, attention: bool, an
 }
 
 pub fn attach(config: &Path, target: Target<'_>) -> Result<()> {
-    attach_checked(config, target, None, None)
+    attach_checked(config, target, None, None, None)
 }
 
-pub(crate) fn attach_checked(config: &Path, target: Target<'_>, expected: Option<&str>, expected_ticks: Option<u64>) -> Result<()> {
+pub(crate) fn attach_checked(config: &Path, target: Target<'_>, expected: Option<&str>, expected_ticks: Option<u64>, expected_window: Option<u32>) -> Result<()> {
     let view = status(config, target)?;
     if !matches!(view.state, "attached" | "detached") {
         return Err(err("managed screen session is not running; refusing to attach by guessed name"));
     }
-    let full = view.full_id.ok_or_else(|| err("missing managed screen session ID"))?;
+    let full = view.full_id.clone().ok_or_else(|| err("missing managed screen session ID"))?;
     if expected.is_some_and(|id| id != full) { return Err(err("screen identity changed before attach")); }
     if expected_ticks.is_some() && expected_ticks != view.process_start_ticks { return Err(err("screen process generation changed before attach")); }
+    let windows = windows_for_status(config, target, &view)?;
+    let matches = windows.iter().filter(|window| window.title == view.screen_name
+        && expected_window.map_or(true, |number| window.number == number)).collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(err("no unique Codex/Bridge window is available; anchor windows are never attach targets"));
+    }
+    let target_window = matches[0].number;
+    let latest = status(config, target)?;
+    if latest.full_id.as_deref() != Some(full.as_str())
+        || latest.process_start_ticks != view.process_start_ticks
+        || !matches!(latest.state, "attached" | "detached") {
+        return Err(err("screen identity changed immediately before attach"));
+    }
     let flag = if view.state == "attached" { "-x" } else { "-r" };
-    let rc = Command::new("screen").arg(flag).arg(&full).status()
+    let rc = Command::new("screen").arg("-p").arg(target_window.to_string())
+        .arg(flag).arg(&full).status()
         .map_err(|_| err("cannot attach to GNU screen session"))?;
     if !rc.success() { return Err(err("GNU screen attach failed")); }
     Ok(())
@@ -591,6 +649,18 @@ fn list_impl(config: &Path, tolerate_discovery_failure: bool) -> Result<Vec<Stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_window_inventory_is_strict_and_read_only_metadata() {
+        let parsed = parse_windows("0:g2c-anchor 1:q30-0123456789ab ").unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], Window { number: 0, title: "g2c-anchor".into() });
+        assert_eq!(parsed[1], Window { number: 1, title: "q30-0123456789ab".into() });
+        assert!(parse_windows("").is_err());
+        assert!(parse_windows("0:g2c-anchor 0:g2c-demo").is_err());
+        assert!(parse_windows("100:g2c-demo").is_err());
+        assert!(parse_windows("1:window with spaces").is_err());
+    }
 
     #[test]
     fn screen_names_are_derived_only_from_valid_registered_ids() {

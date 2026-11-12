@@ -25,6 +25,22 @@ target_compile_options(gpt2codex-gui PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(gpt2codex-gui PRIVATE "G2C_GUI_SOURCE_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/..\"" "G2C_INSTALLED_BACKEND_DIR=\"${CMAKE_INSTALL_FULL_LIBDIR}/gpt2codex/backends\"")
 install(TARGETS gpt2codex-gui RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
+# The GUI runs these helpers through python3 -B. Keep the paired entry points
+# and their local imports together; they do not belong in /usr/bin.
+set(G2C_QUEUE_PYTHON_FILES
+    gpt2codex-github-queue.py
+    gpt2codex_queue_screen.py
+    gpt2codex_queue_project.py
+    gpt2codex_queue_dispatch.py
+    gpt2codex_queue_handoff.py
+    gpt2codex_queue_codex.py)
+set(G2C_QUEUE_PYTHON_INSTALL_FILES)
+foreach(script IN LISTS G2C_QUEUE_PYTHON_FILES)
+    list(APPEND G2C_QUEUE_PYTHON_INSTALL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../${script}")
+endforeach()
+install(FILES ${G2C_QUEUE_PYTHON_INSTALL_FILES}
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/gpt2codex")
+
 if(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
     set(G2C_BACKEND_BUILD_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/gpt2codex-backends")
 else()

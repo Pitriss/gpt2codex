@@ -13,7 +13,9 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QApplication>
+#include "queue_worker_monitor.h"
 #include <QClipboard>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QColor>
 #include <QCoreApplication>
@@ -88,6 +90,8 @@ struct Options {
     QString config;
     QString queueHelper;
     QString queueConfig;
+    QString queueRepoRoot;    // Mutable worker checkout, never the installed script directory.
+    QString queueRootError;
     bool queueOnly = false;
     bool selfTest = false;
     bool themeProbe = false;
@@ -95,15 +99,22 @@ struct Options {
     bool backendProbe = false;
 };
 
-// Prefer the installed sibling CLI; development builds also carry their source
-// location. PATH is used only when an executable was actually found there.
-QString localHelper(const QString &name) {
+// Locate both Queue entry points together, preferring the installed
+// directory over the development checkout.
+// Discover the *pair*: a lone screen helper cannot display or approve GitHub
+// Issues. In particular gpt2codex-github-queue.py is NOT --queue-helper.
+QString localQueueHelper() {
     const QString app = QCoreApplication::applicationDirPath();
     const QStringList roots{app, app + "/../../", app + "/../lib/gpt2codex",
         app + "/../share/gpt2codex", QString::fromUtf8(G2C_GUI_SOURCE_ROOT)};
     for (const auto &root : roots) {
-        QFileInfo file(QDir(root).filePath(name));
-        if (file.isFile()) { return file.canonicalFilePath(); }
+        const QFileInfo screen(QDir(root).filePath(QStringLiteral("gpt2codex_queue_screen.py")));
+        const QFileInfo queue(QDir(root).filePath(QStringLiteral("gpt2codex-github-queue.py")));
+        if (screen.isFile() && screen.isReadable() && queue.isFile() && queue.isReadable()
+            && QFileInfo(screen.canonicalFilePath()).absolutePath()
+                == QFileInfo(queue.canonicalFilePath()).absolutePath()) {
+            return screen.canonicalFilePath();
+        }
     }
     return {};
 }
@@ -119,6 +130,33 @@ QString defaultBridgeConfig() {
 QString defaultQueueConfig() {
     // Same default as gpt2codex-github-queue.py, deliberately independent of XDG.
     return QDir::homePath() + "/.config/gpt2codex/github-queue/config.json";
+}
+
+// A packaged helper lives in /usr/share/gpt2codex, while the worker's actual
+// state/log paths are relative to its existing writable project checkout.
+// Never let an installed helper silently start using /usr/share as a store.
+QString queueWorkingRoot(const QString &configPath, const QString &screenHelper) {
+    QStringList candidates;
+    QFile file(configPath);
+    if (file.open(QIODevice::ReadOnly) && file.size() <= 64 * 1024) {
+        const auto config = QJsonDocument::fromJson(file.readAll()).object();
+        if (config.value(QStringLiteral("version")).toInt(-1) == 1) {
+            const auto projects = config.value(QStringLiteral("project_roots")).toObject();
+            const auto checkout = projects.value(QStringLiteral("gpt2codex")).toString();
+            if (!checkout.isEmpty()) { candidates << checkout; }
+        }
+    }
+    if (!screenHelper.isEmpty()) { candidates << QFileInfo(screenHelper).absolutePath(); }
+    for (const QString &candidate : candidates) {
+        const QFileInfo root(candidate);
+        if (!root.isAbsolute() || !root.isDir()) { continue; }
+        const QString canonical = root.canonicalFilePath();
+        if (!canonical.isEmpty() && QFileInfo(canonical + QStringLiteral("/.tmp")).isDir()
+            && QFileInfo(canonical + QStringLiteral("/.log")).isDir()) {
+            return canonical;
+        }
+    }
+    return {};
 }
 
 bool queueAllowedProjects(const QString &path, QSet<QString> &ids, QString &error) {
@@ -208,15 +246,27 @@ bool parseOptions(const QStringList &arguments, Options &options, QString &error
         return false;
     }
     if (options.queueHelper.isEmpty()) {
-        options.queueHelper = localHelper(QStringLiteral("gpt2codex_queue_screen.py"));
+        options.queueHelper = localQueueHelper();
     }
     if (!options.queueHelper.isEmpty()) {
-        QFileInfo helper(options.queueHelper);
-        if (!helper.isAbsolute() || !helper.isFile()) {
-            error = QStringLiteral("--queue-helper vyžaduje existující absolutní soubor");
+        const QFileInfo helper(options.queueHelper);
+        const QFileInfo queue(helper.dir().filePath(QStringLiteral("gpt2codex-github-queue.py")));
+        if (!helper.isAbsolute() || !helper.isFile() || !helper.isReadable()
+            || helper.fileName() != QStringLiteral("gpt2codex_queue_screen.py")
+            || !queue.isFile() || !queue.isReadable()
+            || QFileInfo(helper.canonicalFilePath()).absolutePath()
+                != QFileInfo(queue.canonicalFilePath()).absolutePath()) {
+            error = QStringLiteral("--queue-helper musí být gpt2codex_queue_screen.py "
+                "se sourozeneckým gpt2codex-github-queue.py (nikoli samotný GitHub CLI)");
             return false;
         }
         options.queueHelper = helper.canonicalFilePath();
+        options.queueRepoRoot = queueWorkingRoot(options.queueConfig, options.queueHelper);
+        if (options.queueRepoRoot.isEmpty()) {
+            options.queueRootError = QStringLiteral("GitHub Queue: nelze určit pracovní adresář workeru. "
+                "V %1 ověř project_roots.gpt2codex a existující .tmp/.log.")
+                .arg(options.queueConfig);
+        }
     }
     return true;
 }
@@ -547,7 +597,7 @@ public:
         lengthBox_->setSuffix(QStringLiteral(" znaků"));
         tabsForm->addRow(QStringLiteral("Maximální délka názvu:"), lengthBox_);
         tabsLayout->addLayout(tabsForm);
-        auto *tabsHint = new QLabel(QStringLiteral("Celý název úkolu zůstane v tooltipu. Záložka Bridge je připnutá."), tabsPage);
+        auto *tabsHint = new QLabel(QStringLiteral("Celý název úkolu zůstane v tooltipu. Záložka Queue Worker je připnutá."), tabsPage);
         tabsHint->setWordWrap(true);
         tabsLayout->addWidget(tabsHint);
         tabsLayout->addStretch();
@@ -608,8 +658,18 @@ struct Session {
     QString exitCode = QStringLiteral("-");
     QString exitSignal = QStringLiteral("-");
     QString exitedAt = QStringLiteral("-");
+    QString windowNumber = QStringLiteral("-");
+    QString windowTitle = QStringLiteral("-");
     QString key() const { return multiplexer + QLatin1Char(':') + id; }
     bool running() const { return state == QStringLiteral("attached") || state == QStringLiteral("detached"); }
+    bool hasCodexView() const {
+        if (!running()) { return false; }
+        if (multiplexer == QStringLiteral("tmux")) {
+            return programState == QStringLiteral("running") || programState == QStringLiteral("exited");
+        }
+        return programState == QStringLiteral("running")
+            && windowNumber != QStringLiteral("-") && windowTitle == screenName;
+    }
 };
 
 // A freshly verified screen list must refer to the same recorded process,
@@ -621,7 +681,9 @@ bool sameLiveSessionIdentity(const Session &previous, const Session &current) {
         && previous.multiplexer == current.multiplexer
         && previous.generation == current.generation
         && previous.screenName == current.screenName
-        && previous.sessionId == current.sessionId;
+        && previous.sessionId == current.sessionId
+        && previous.windowNumber == current.windowNumber
+        && previous.windowTitle == current.windowTitle;
 }
 
 g2cattention::Identity attentionIdentity(const Session &session) {
@@ -648,6 +710,9 @@ QStringList attachArguments(const Options &options, const Session &session) {
     } else {
         args << QStringLiteral("--id") << session.id;
     }
+    if (session.multiplexer == QStringLiteral("screen") && session.windowNumber != QStringLiteral("-")) {
+        args << QStringLiteral("--window") << session.windowNumber;
+    }
     if (!options.config.isEmpty()) {
         args << QStringLiteral("--config") << options.config;
     }
@@ -661,7 +726,7 @@ bool parseSessions(const QByteArray &bytes, QList<Session> &sessions, QString &e
         return false;
     }
     static const QRegularExpression lineExpression(
-        QStringLiteral(R"(^(?:multiplexer=(screen|tmux) generation=([0-9]{1,20}|-) )?project_id=([a-z0-9_-]{1,64}) screen_name=(g2c-[a-z0-9_-]{1,68}) state=(attached|detached|interrupted|unconfirmed|unknown|not_registered) session_id=(\S{1,128}) (?:program=(unknown|running|exited) exit_code=(-|[0-9]{1,3}) exit_signal=(-|[A-Z0-9]{1,16}) exited_at=(-|[0-9]{1,20}) )?task=(.{1,192})$)"));
+        QStringLiteral(R"(^(?:multiplexer=(screen|tmux) generation=([0-9]{1,20}|-) )?project_id=([a-z0-9_-]{1,64}) screen_name=(g2c-[a-z0-9_-]{1,68}) state=(attached|detached|interrupted|unconfirmed|unknown|not_registered) session_id=(\S{1,128}) (?:program=(unknown|running|anchor|exited) exit_code=(-|[0-9]{1,3}) exit_signal=(-|[A-Z0-9]{1,16}) exited_at=(-|[0-9]{1,20})(?: window=([0-9]{1,2}|-) window_title=([A-Za-z0-9_-]{1,80}|-))? )?task=(.{1,192})$)"));
     static const QRegularExpression idExpression(QStringLiteral(R"(^[1-9][0-9]{0,9}\.g2c-[a-z0-9_-]{1,64}$)"));
     static const QRegularExpression tmuxIdExpression(QStringLiteral(R"(^[1-9][0-9]{0,9}\.\$[0-9]{1,20}\.[1-9][0-9]{0,19}$)"));
     const QString text = QString::fromUtf8(bytes);
@@ -681,17 +746,35 @@ bool parseSessions(const QByteArray &bytes, QList<Session> &sessions, QString &e
             error = QStringLiteral("Neznámý formát session list; nepřipojuji relace");
             return false;
         }
-        Session item{match.captured(3), match.captured(4), match.captured(5), match.captured(6), match.captured(11),
+        Session item{match.captured(3), match.captured(4), match.captured(5), match.captured(6), match.captured(13),
             match.captured(1).isEmpty() ? QStringLiteral("screen") : match.captured(1), match.captured(2)};
         if (!match.captured(7).isEmpty()) {
             item.programState = match.captured(7);
             item.exitCode = match.captured(8);
             item.exitSignal = match.captured(9);
             item.exitedAt = match.captured(10);
+            item.windowNumber = match.captured(11).isEmpty() ? QStringLiteral("-") : match.captured(11);
+            item.windowTitle = match.captured(12).isEmpty() ? QStringLiteral("-") : match.captured(12);
+            const bool tmuxRunning = item.programState == QStringLiteral("running")
+                && item.multiplexer == QStringLiteral("tmux") && item.running()
+                && item.windowNumber == QStringLiteral("-") && item.windowTitle == QStringLiteral("-");
+            const bool terminalExit = item.programState == QStringLiteral("exited")
+                && item.multiplexer == QStringLiteral("tmux") && item.running()
+                && item.windowNumber == QStringLiteral("-") && item.windowTitle == QStringLiteral("-");
+            const bool screenCodex = item.programState == QStringLiteral("running")
+                && item.multiplexer == QStringLiteral("screen") && item.running()
+                && item.windowNumber != QStringLiteral("-") && item.windowTitle == item.screenName;
+            const bool screenAnchor = item.programState == QStringLiteral("anchor")
+                && item.multiplexer == QStringLiteral("screen") && item.running()
+                && item.windowNumber != QStringLiteral("-") && item.windowTitle == QStringLiteral("g2c-anchor");
+            const bool unknown = item.programState == QStringLiteral("unknown")
+                && item.exitCode == QStringLiteral("-") && item.exitSignal == QStringLiteral("-")
+                && item.exitedAt == QStringLiteral("-")
+                && item.windowNumber == QStringLiteral("-") && item.windowTitle == QStringLiteral("-");
             if ((item.exitCode != QStringLiteral("-") && item.exitCode.toInt() > 255)
                 || (item.programState != QStringLiteral("exited") && (item.exitCode != QStringLiteral("-") || item.exitSignal != QStringLiteral("-") || item.exitedAt != QStringLiteral("-")))
-                || (item.programState != QStringLiteral("unknown") && (item.multiplexer != QStringLiteral("tmux") || !item.running()))) {
-                error = QStringLiteral("Nekonzistentní stav programu");
+                || !(tmuxRunning || terminalExit || screenCodex || screenAnchor || unknown)) {
+                error = QStringLiteral("Nekonzistentní stav programu nebo screen okna");
                 return false;
             }
         }
@@ -731,7 +814,7 @@ QString displayName(const Session &session, int maxLength = defaultMaxTabLabelCh
     return (full.size() > room ? full.left(room - 1) + QStringLiteral("…") : full) + suffix;
 }
 
-QString startupBridgeKey(const QList<Session> &sessions) {
+[[maybe_unused]] QString startupBridgeKey(const QList<Session> &sessions) {
     for (const QString &mux : {QStringLiteral("screen"), QStringLiteral("tmux")}) {
         for (const Session &session : sessions) {
             if (session.id == QStringLiteral("bridge") && session.multiplexer == mux && session.running()) {
@@ -765,13 +848,13 @@ public:
         connect(reconnect_, &QPushButton::clicked, this, [this] {
             // A user-approved reconnect is still conditional on the next
             // listing reporting exactly the identity shown at click time.
-            if (!session_.running()) { return; }
+            if (!session_.hasCodexView()) { return; }
             expectedReattachSessionId_ = session_.sessionId;
             intentionallyDetached_ = false;
             wantAttach_ = true;
             if (refreshRequested_) { refreshRequested_(); }
         });
-        if (session.running()) { attach(); }
+        if (session.hasCodexView()) { attach(); }
         update(session);
         // The pinned Bridge is created before the first asynchronous listing.
         initialListing_ = session.id == QStringLiteral("bridge")
@@ -784,8 +867,8 @@ public:
     const Session &session() const { return session_; }
     void setPresentationChanged(std::function<void()> callback) { presentationChanged_ = std::move(callback); }
     bool attentionEnabled() const {
-        return terminal_ && session_.running() && !identityChanged_ && !intentionallyDetached_
-            && session_.programState != QStringLiteral("exited");
+        return terminal_ && session_.hasCodexView() && session_.programState != QStringLiteral("exited")
+            && !identityChanged_ && !intentionallyDetached_;
     }
 
     bool containsTerminal(QWidget *widget) const {
@@ -793,7 +876,7 @@ public:
     }
 
     void activateTerminal() {
-        if (!terminal_ && session_.running() && !intentionallyDetached_ && !identityChanged_ && !wantAttach_) {
+        if (!terminal_ && session_.hasCodexView() && !intentionallyDetached_ && !identityChanged_ && !wantAttach_) {
             expectedReattachSessionId_ = session_.sessionId;
             wantAttach_ = true;
             if (refreshRequested_) { refreshRequested_(); }
@@ -843,9 +926,9 @@ public:
         // session. A NEW listing must still identify the same session PID.
         preference_ = preference;
         const bool restore = terminal_ || wantAttach_;
-        expectedReattachSessionId_ = restore && session_.running() ? session_.sessionId : QString();
+        expectedReattachSessionId_ = restore && session_.hasCodexView() ? session_.sessionId : QString();
         detachTerminal();
-        wantAttach_ = restore && session_.running() && !intentionallyDetached_ && !identityChanged_;
+        wantAttach_ = restore && session_.hasCodexView() && !intentionallyDetached_ && !identityChanged_;
         hint_->setText(QStringLiteral("Přepínám backend; ověřuji původní identitu relace…"));
         hint_->show();
         reconnect_->hide();
@@ -853,7 +936,7 @@ public:
     void update(const Session &session) {
         if (initialListing_) {
             initialListing_ = false;
-            wantAttach_ = session.running();
+            wantAttach_ = session.hasCodexView();
         }
         // Do not silently adopt a replacement session that happens to use
         // the same project ID/name. This also applies to an existing view.
@@ -882,11 +965,14 @@ public:
             + QStringLiteral("    Proces: ") + (session.programState == QStringLiteral("exited")
                 ? QStringLiteral("ukončen (exit %1, signál %2); bez automatického restartu").arg(session.exitCode, session.exitSignal)
                 : session.programState == QStringLiteral("running") ? QStringLiteral("běží") : QStringLiteral("nesledován / neověřen")));
-        if (!session.running()) {
+        if (!session.hasCodexView()) {
             const QString target = session.id == "bridge" ? QStringLiteral("--bridge") : "--id " + session.id;
-            hint_->setText((session.state == "not_registered"
-                ? QStringLiteral("Projekt je v konfiguraci; pro tento multiplexer chybí registrovaná relace. Jméno cizího screenu není registrace. ")
-                : QStringLiteral("Relace není ověřena jako dostupná. "))
+            const QString reason = session.programState == "anchor"
+                ? QStringLiteral("Projekt obsahuje pouze kotevní okno; Codex v něm neběží. ")
+                : session.state == "not_registered"
+                    ? QStringLiteral("Projekt je pouze registrován; aktivní Codex relace neexistuje. ")
+                    : QStringLiteral("Aktivní Codex okno není ověřeno. ");
+            hint_->setText(reason
                 + QStringLiteral("GUI nic nespouští ani nepřebírá. Ověření: %1 session status %2 --multiplexer %3 --config %4")
                     .arg(options_.bridgeCli, target, session.multiplexer,
                          options_.config.isEmpty() ? defaultBridgeConfig() : options_.config));
@@ -969,7 +1055,7 @@ private:
     }
 
     void attach() {
-        if (terminal_ || !session_.running()) { return; }
+        if (terminal_ || !session_.hasCodexView()) { return; }
         screenPrefix_ = false;
         wantAttach_ = false;
         Gpt2CodexTerminalBackend *provider = nullptr;
@@ -1069,214 +1155,249 @@ QueueScreenRows parseQueueScreenRows(const QJsonArray &values) {
 }
 
 bool activeQueueRow(const QJsonObject &row) {
+    // A surviving legacy screen window is not proof of an active Queue job.
+    // The Queue status is authoritative for the Active/History filter.
     const auto status = row.value("queue_status").toString();
-    return row.value("screen_alive").toBool() || row.value("attachable").toBool()
-        || status == "pending" || status == "approved" || status == "approved-screen"
+    return status == "pending" || status == "approved" || status == "approved-screen"
+        || status == "approved-project-screen" || status == "blocked"
         || status == "running";
 }
 
-// Presentation only: all slot identity checks and the non-stealing attachment
-// remain in the existing Python helper. No prompt, approval or server control.
+// GitHub Queue is an operator inbox. It never creates a Codex terminal,
+// changes a screen window or starts a task. An explicit GUI approval is bound
+// to the complete freshly verified remote Issue SHA-256 by the local CLI.
 class QueuePage final : public QWidget {
     Q_OBJECT
 public:
-    QueuePage(const Options &options, BackendRegistry &backends, QWidget *parent = nullptr)
-        : QWidget(parent), options_(options), backends_(backends),
+    QueuePage(const Options &options, BackendRegistry &, QWidget *parent = nullptr)
+        : QWidget(parent), options_(options),
           python_(QStandardPaths::findExecutable(QStringLiteral("python3"))) {
         setObjectName(QStringLiteral("githubQueuePage"));
         auto *outer = new QVBoxLayout(this);
-        auto *notice = new QLabel(QStringLiteral("Schválení probíhá dosavadním lokálním queue CLI. GUI úlohy neschvaluje ani nespouští. tui_starting vyžaduje vizuální ověření TUI."), this);
-        notice->setWordWrap(true);
-        outer->addWidget(notice);
         auto *split = new QSplitter(Qt::Horizontal, this);
+        split->setObjectName(QStringLiteral("queueTaskSplitter"));
+        split->setChildrenCollapsible(false);
+
         auto *left = new QWidget(split);
         auto *leftLayout = new QVBoxLayout(left);
         leftLayout->setContentsMargins(0, 0, 0, 0);
-        left->setMinimumWidth(260);
+        left->setMinimumWidth(250);
+        auto *top = new QHBoxLayout;
         filter_ = new QComboBox(left);
         filter_->setObjectName(QStringLiteral("queueTaskFilter"));
         filter_->addItems({QStringLiteral("Aktivní"), QStringLiteral("Historie")});
-        leftLayout->addWidget(filter_);
-        connect(filter_, &QComboBox::currentIndexChanged, this, [this] { applyFilter(); });
+        top->addWidget(filter_, 1);
+        auto *refreshButton = new QPushButton(QStringLiteral("Obnovit"), left);
+        refreshButton->setObjectName(QStringLiteral("queueTaskRefresh"));
+        top->addWidget(refreshButton);
+        leftLayout->addLayout(top);
         list_ = new QListWidget(left);
         list_->setObjectName(QStringLiteral("queueTaskList"));
-        list_->setWordWrap(true);
+        list_->setWordWrap(false);
+        list_->setTextElideMode(Qt::ElideRight);
         leftLayout->addWidget(list_, 1);
-        detail_ = new QLabel(left);
-        detail_->setObjectName(QStringLiteral("queueTaskDetail"));
-        detail_->setWordWrap(true);
-        detail_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        leftLayout->addWidget(detail_);
-        auto *buttons = new QHBoxLayout;
-        auto *refresh = new QPushButton(QStringLiteral("Obnovit"), left);
-        refresh->setObjectName(QStringLiteral("queueTaskRefresh"));
-        open_ = new QPushButton(QStringLiteral("Otevřít úlohu"), left);
-        open_->setObjectName(QStringLiteral("queueTaskOpen"));
-        buttons->addWidget(refresh); buttons->addWidget(open_);
-        leftLayout->addLayout(buttons);
-        right_ = new QWidget(split);
-        right_->setMinimumSize(340, 240);
-        auto *rightLayout = new QVBoxLayout(right_);
-        terminalStatus_ = new QLabel(QStringLiteral("Vyber úlohu a otevři její existující TUI."), right_);
-        terminalStatus_->setWordWrap(true);
-        rightLayout->addWidget(terminalStatus_);
-        detach_ = new QPushButton(QStringLiteral("Odpojit"), right_);
-        detach_->setObjectName(QStringLiteral("queueTaskDetach"));
-        detach_->setEnabled(false);
-        rightLayout->addWidget(detach_);
-        split->setChildrenCollapsible(false);
-        split->setStretchFactor(0, 0); split->setStretchFactor(1, 1);
-        split->setSizes({340, 740});
+
+        auto *right = new QWidget(split);
+        right->setMinimumWidth(320);
+        auto *rightLayout = new QVBoxLayout(right);
+        rightLayout->setContentsMargins(0, 0, 0, 0);
+        header_ = new QLabel(QStringLiteral("Vyber úlohu"), right);
+        header_->setObjectName(QStringLiteral("queueTaskHeader"));
+        header_->setWordWrap(true);
+        rightLayout->addWidget(header_);
+        metadata_ = new QLabel(right);
+        metadata_->setObjectName(QStringLiteral("queueTaskDetail"));
+        metadata_->setWordWrap(true);
+        metadata_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        rightLayout->addWidget(metadata_);
+        task_ = new QPlainTextEdit(right);
+        task_->setObjectName(QStringLiteral("queueTaskBody"));
+        task_->setReadOnly(true);
+        task_->setPlaceholderText(QStringLiteral("Úplné zadání vybrané úlohy se načte z GitHub Queue."));
+        rightLayout->addWidget(task_, 1);
+        approval_ = new QCheckBox(QStringLiteral("Zkontroloval jsem celé zadání a schvaluji jeho provedení."), right);
+        approval_->setObjectName(QStringLiteral("queueTaskApproval"));
+        approval_->setEnabled(false);
+        rightLayout->addWidget(approval_);
+        auto *actions = new QHBoxLayout;
+        action_ = new QComboBox(right);
+        action_->setObjectName(QStringLiteral("queueTaskAction"));
+        action_->addItem(QStringLiteral("Schválit"), QStringLiteral("approve"));
+        action_->addItem(QStringLiteral("Zamítnout"), QStringLiteral("reject"));
+        actions->addWidget(action_, 1);
+        confirm_ = new QPushButton(QStringLiteral("OK"), right);
+        confirm_->setObjectName(QStringLiteral("queueTaskConfirm"));
+        confirm_->setEnabled(false);
+        actions->addWidget(confirm_);
+        rightLayout->addLayout(actions);
+        split->setSizes({410, 690});
         outer->addWidget(split, 1);
-        hint_ = new QLabel(this); hint_->setObjectName(QStringLiteral("queueTaskHint"));
-        hint_->setWordWrap(true); outer->addWidget(hint_);
-        connect(refresh, &QPushButton::clicked, this, &QueuePage::refresh);
-        connect(open_, &QPushButton::clicked, this, &QueuePage::openSelected);
-        connect(detach_, &QPushButton::clicked, this, &QueuePage::disconnectTerminal);
-        connect(list_, &QListWidget::currentItemChanged, this, [this] { updateDetail(); });
-        connect(list_, &QListWidget::itemDoubleClicked, this, [this] { openSelected(); });
-        // Use the same native backend clipboard path and shortcut filter as
-        // project tabs, also in --queue-only where the main menus are absent.
-        new PasteShortcutFilter(this, [this](QWidget *w) {
-            return isVisible() && containsTerminal(w);
-        }, [this] { pasteClipboardText(); });
+        hint_ = new QLabel(this);
+        hint_->setObjectName(QStringLiteral("queueTaskHint"));
+        hint_->setWordWrap(true);
+        outer->addWidget(hint_);
+
+        connect(refreshButton, &QPushButton::clicked, this, &QueuePage::refresh);
+        connect(filter_, &QComboBox::currentIndexChanged, this, [this] { applyFilter(); });
+        connect(list_, &QListWidget::currentItemChanged, this, [this] {
+            loadSelectedDetail();
+        });
+        connect(approval_, &QCheckBox::toggled, this, [this] { updateAction(); });
+        connect(action_, &QComboBox::currentIndexChanged, this, [this] {
+            approval_->setText(action_->currentData().toString() == QStringLiteral("approve")
+                ? QStringLiteral("Zkontroloval jsem celé zadání a schvaluji jeho provedení.")
+                : QStringLiteral("Potvrzuji zamítnutí vybrané úlohy."));
+            approval_->setChecked(false);
+            updateAction();
+        });
+        connect(confirm_, &QPushButton::clicked, this, &QueuePage::performAction);
         timer_.setInterval(6000);
         connect(&timer_, &QTimer::timeout, this, &QueuePage::refresh);
         timer_.start();
-        updateDetail();
         QTimer::singleShot(0, this, &QueuePage::refresh);
     }
     ~QueuePage() override {
-        // Only metadata subprocesses belong to this page. The backend owns its
-        // transient screen -r client; no screen server is signalled here.
         for (auto *proc : findChildren<QProcess *>(QStringLiteral("queueMetadataQuery"))) {
             disconnect(proc, nullptr, this, nullptr);
-            if (proc->state() != QProcess::NotRunning) { proc->kill(); proc->waitForFinished(1000); }
-        }
-    }
-    bool containsTerminal(QWidget *widget) const {
-        return terminal_ && widget && (widget == terminal_ || terminal_->isAncestorOf(widget));
-    }
-    void focusTerminal() {
-        if (!isVisible() || !terminal_) { return; }
-        QWidget *target = terminal_;
-        for (auto *child : terminal_->findChildren<QWidget *>()) {
-            if (QString::fromLatin1(child->metaObject()->className()).endsWith("TerminalDisplay")) {
-                target = child; break;
+            if (proc->state() != QProcess::NotRunning) {
+                proc->kill();
+                proc->waitForFinished(1000);
             }
         }
-        target->setFocus(Qt::OtherFocusReason);
     }
-    bool pasteClipboardText() {
-        bool accepted = false;
-        return terminal_ && QMetaObject::invokeMethod(terminal_, "pasteClipboardText",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, accepted)) && accepted;
-    }
-    void disconnectTerminal() {
-        if (!terminal_) { return; }
-        auto *old = terminal_.data(); terminal_ = nullptr;
-        disconnect(old, nullptr, this, nullptr);
-        delete old; // Existing terminal backend destroys only its client PTY.
-        terminalStatus_->setText(QStringLiteral("Odpojeno: %1. Screen a Codex mohou dál běžet.").arg(attachedSlot_));
-        attachedSlot_.clear(); detach_->setEnabled(false); updateDetail();
-    }
+    // Compatibility with the main window's terminal-only keyboard/menu paths.
+    // Queue itself has no terminal widget or implicit connection side effect.
+    bool containsTerminal(QWidget *) const { return false; }
+    void focusTerminal() {}
+    bool pasteClipboardText() { return false; }
+    void disconnectTerminal() {}
+
     void refresh() {
-        if (busy_) { return; }
+        if (busy_ || acting_) { return; }
+        if (!options_.queueRootError.isEmpty()) {
+            hint_->setText(options_.queueRootError);
+            return;
+        }
         if (options_.queueHelper.isEmpty() || python_.isEmpty()) {
-            fresh_ = false; updateDetail();
-            hint_->setText(QStringLiteral("Queue helper nebo python3 není dostupný. Použij --queue-helper /absolutní/cesta/gpt2codex_queue_screen.py. Projekty zůstávají dostupné."));
+            hint_->setText(QStringLiteral("Queue helper nebo Python 3 nejsou dostupné."));
             return;
         }
         busy_ = true;
-        query(options_.queueHelper, [this](bool ok, const QByteArray &raw) {
-            const auto doc = QJsonDocument::fromJson(raw);
+        query(options_.queueHelper, {QStringLiteral("list")}, [this](bool ok, const QByteArray &raw) {
+            const QJsonDocument doc = QJsonDocument::fromJson(raw);
             if (!ok || !doc.isArray()) {
-                busy_ = false; fresh_ = false; updateDetail();
-                hint_->setText(QStringLiteral("Screen metadata nejsou dostupná; seznam je ponechán, otevírání pozastaveno. Zkus Obnovit."));
+                busy_ = false;
+                hint_->setText(QStringLiteral("Lokální metadata Queue nejsou dostupná."));
                 return;
             }
-            const auto parsedScreens = parseQueueScreenRows(doc.array());
-            auto rows = parsedScreens.rows;
-            screenWarnings_ = parsedScreens.warnings;
-            const QString cli = QFileInfo(options_.queueHelper).dir().filePath("gpt2codex-github-queue.py");
+            const auto screens = parseQueueScreenRows(doc.array());
+            auto rows = screens.rows;
+            screenWarnings_ = screens.warnings;
+            const auto cli = queueCli();
             if (!QFileInfo(cli).isFile()) { finishRefresh(rows, false); return; }
-            query(cli, [this, rows](bool jobsOk, const QByteArray &jobsRaw) mutable {
-                // Existing local CLI list is metadata-only, before read_token.
-                // Parse only its explicit number/status/project/mode/digest format.
-                static const QRegularExpression line(QStringLiteral("^#([0-9]+)\\s+(\\S+)\\s+(\\S+)\\s+(read-only|workspace-write)\\s+([0-9a-f]{12}) (.*)$"));
+            query(cli, {QStringLiteral("gui-list")}, [this, rows](bool jobsOk, const QByteArray &jobsRaw) mutable {
                 const auto screenRows = rows;
-                bool parsed = jobsOk;
-                for (const auto &text : QString::fromUtf8(jobsRaw).split('\n', Qt::SkipEmptyParts)) {
-                    if (text == "No accepted queue requests") { continue; }
-                    const auto match = line.match(text);
-                    if (!match.hasMatch()) { parsed = false; break; }
-                    const int number = match.captured(1).toInt();
-                    bool found = false;
-                    for (auto &row : rows) {
-                        if (row.value("number").toInt() != number) { continue; }
-                        row.insert("title", match.captured(6));
-                        row.insert("queue_status", match.captured(2)); found = true;
-                    }
-                    if (!found) {
-                        rows.append(QJsonObject{{"key", QStringLiteral("issue:%1").arg(number)},
-                            {"number", number}, {"project", match.captured(3)}, {"title", match.captured(6)},
-                            {"queue_status", match.captured(2)}, {"attachable", false}});
+                const auto doc = QJsonDocument::fromJson(jobsRaw);
+                bool parsed = jobsOk && doc.isArray();
+                if (parsed) {
+                    for (const auto &entry : doc.array()) {
+                        if (!entry.isObject()) { parsed = false; break; }
+                        const auto job = entry.toObject();
+                        const int number = job.value("number").toInt(-1);
+                        const QString project = job.value("project").toString();
+                        const QString status = job.value("status").toString();
+                        const QString title = job.value("title").toString();
+                        if (number <= 0 || project.isEmpty() || status.isEmpty() || title.isEmpty()) {
+                            parsed = false; break;
+                        }
+                        bool found = false;
+                        for (auto &row : rows) {
+                            if (row.value("number").toInt() != number) { continue; }
+                            row.insert("title", title);
+                            row.insert("queue_status", status);
+                            row.insert("mode", job.value("mode"));
+                            found = true;
+                        }
+                        if (!found) {
+                            rows.append(QJsonObject{{"key", QStringLiteral("issue:%1").arg(number)},
+                                {"number", number}, {"project", project}, {"title", title},
+                                {"mode", job.value("mode")}, {"queue_status", status},
+                                {"attachable", false}});
+                        }
                     }
                 }
                 finishRefresh(parsed ? rows : screenRows, parsed);
             });
         });
     }
-private Q_SLOTS:
-    void terminalFinished() {
-        if (sender() != terminal_) { return; }
-        auto *old = terminal_.data(); terminal_ = nullptr;
-        old->deleteLater(); attachedSlot_.clear(); detach_->setEnabled(false);
-        terminalStatus_->setText(QStringLiteral("Klientský terminál skončil. Ověř stav pomocí Obnovit; připojení jinde se nepřebírá."));
-        updateDetail();
-    }
 private:
-    void query(const QString &script, std::function<void(bool, const QByteArray &)> done) {
+    QString queueCli() const {
+        return QFileInfo(options_.queueHelper).dir().filePath(QStringLiteral("gpt2codex-github-queue.py"));
+    }
+    void query(const QString &script, const QStringList &args,
+               std::function<void(bool, const QByteArray &)> callback) {
         auto *proc = new QProcess(this);
         proc->setObjectName(QStringLiteral("queueMetadataQuery"));
         auto complete = std::make_shared<bool>(false);
-        auto callback = [proc, complete, done](bool ok) {
-            if (*complete) { return; } *complete = true;
+        auto done = [proc, complete, callback](bool ok) {
+            if (*complete) { return; }
+            *complete = true;
             const auto raw = proc->readAllStandardOutput();
-            done(ok && raw.size() <= 1024 * 1024, raw);
+            callback(ok && raw.size() <= 1024 * 1024, raw);
             proc->deleteLater();
         };
         connect(proc, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
-            [callback](int code, QProcess::ExitStatus status) { callback(code == 0 && status == QProcess::NormalExit); });
-        connect(proc, &QProcess::errorOccurred, this, [callback](QProcess::ProcessError) { callback(false); });
-        QTimer::singleShot(5000, proc, [proc] { if (proc->state() != QProcess::NotRunning) { proc->kill(); } });
-        proc->start(python_, {script, QStringLiteral("list")});
+            [done](int code, QProcess::ExitStatus status) {
+                done(code == 0 && status == QProcess::NormalExit);
+            });
+        connect(proc, &QProcess::errorOccurred, this,
+            [done](QProcess::ProcessError) { done(false); });
+        QTimer::singleShot(script == queueCli() && args.value(0) != QStringLiteral("gui-list") ? 15000 : 5000, proc, [proc] {
+            if (proc->state() != QProcess::NotRunning) { proc->kill(); }
+        });
+        QStringList argv{QStringLiteral("-B"), script};
+        if (script == queueCli() && !options_.queueConfig.isEmpty()) {
+            argv << QStringLiteral("--config") << options_.queueConfig;
+        }
+        if (!options_.queueRepoRoot.isEmpty()) {
+            argv << QStringLiteral("--repo-root") << options_.queueRepoRoot;
+        }
+        argv << args;
+        proc->start(python_, argv);
     }
     void finishRefresh(const QList<QJsonObject> &rows, bool jobsOk) {
-        // Reconcile by stable key without clearing the widget or its selection.
         const QSignalBlocker block(list_);
         QSet<QString> keep;
         for (const auto &row : rows) {
-            const auto key = row.value("key").toString(); keep.insert(key);
+            const auto key = row.value("key").toString();
+            keep.insert(key);
             QListWidgetItem *item = nullptr;
             for (int i = 0; i < list_->count(); ++i) {
-                if (list_->item(i)->data(Qt::UserRole).toString() == key) { item = list_->item(i); break; }
+                if (list_->item(i)->data(Qt::UserRole).toString() == key) {
+                    item = list_->item(i); break;
+                }
             }
             if (!item) { item = new QListWidgetItem(list_); item->setData(Qt::UserRole, key); }
-            const auto title = row.value("title").toString(row.value("slot").toString());
-            const QString text = QStringLiteral("#%1 | %2 | %3\n%4")
-                .arg(row.value("number").toInt()).arg(row.value("project").toString(), title, QStringLiteral("Queue stav: %1 · TUI stav: %2 · attachable: %3")
-                    .arg(row.value("queue_status").toString("—"), row.value("phase").toString("—"),
-                         row.value("attachable").toBool() ? QStringLiteral("ano") : QStringLiteral("ne")));
-            if (item->text() != text) { item->setText(text); }
+            const QString project = row.value("project").toString();
+            QString title = row.value("title").toString(row.value("slot").toString());
+            if (title.startsWith(QStringLiteral("[g2c] "))) { title.remove(0, 6); }
+            if (title.startsWith(project + QStringLiteral(": "))) { title.remove(0, project.size() + 2); }
+            const QString text = QStringLiteral("#%1    %2    %3\n%4")
+                .arg(row.value("number").toInt())
+                .arg(project, row.value("queue_status").toString("—"), title);
+            item->setToolTip(row.value("title").toString());
+            item->setText(text);
             item->setData(Qt::UserRole + 1, row);
         }
         for (int i = list_->count() - 1; i >= 0; --i) {
-            if (!keep.contains(list_->item(i)->data(Qt::UserRole).toString())) { delete list_->takeItem(i); }
+            if (!keep.contains(list_->item(i)->data(Qt::UserRole).toString())) {
+                delete list_->takeItem(i);
+            }
         }
-        busy_ = false; fresh_ = true; applyFilter();
-        hint_->setText(jobsOk ? QStringLiteral("Lokální stav; bez GitHub pollingu. Pending = čeká na lokální schválení.")
-            : QStringLiteral("Lokální queue list není dostupný nebo má neznámý formát; pending úlohy nelze spolehlivě zobrazit. Screen úlohy jsou dostupné."));
+        busy_ = false;
+        applyFilter();
+        hint_->setText(jobsOk ? QStringLiteral("Lokální stav Queue. Detail se ověřuje proti GitHubu při výběru.")
+            : QStringLiteral("Lokální Queue list není dostupný; schvalování je vypnuto."));
         if (!screenWarnings_.isEmpty()) {
             hint_->setText(hint_->text() + '\n' + screenWarnings_.join('\n'));
         }
@@ -1287,63 +1408,171 @@ private:
             item->setHidden(filter_->currentIndex() == 0
                 && !activeQueueRow(item->data(Qt::UserRole + 1).toJsonObject()));
         }
-        updateDetail();
+        if (list_->currentItem() && list_->currentItem()->isHidden()) {
+            list_->setCurrentItem(nullptr);
+        }
+        updateAction();
     }
     QJsonObject selected() const {
-        return list_->currentItem() && !list_->currentItem()->isHidden() ? list_->currentItem()->data(Qt::UserRole + 1).toJsonObject() : QJsonObject();
+        if (!list_->currentItem() || list_->currentItem()->isHidden()) { return {}; }
+        return list_->currentItem()->data(Qt::UserRole + 1).toJsonObject();
     }
-    bool canOpen(const QJsonObject &row) const {
-        const QString phase = row.value("phase").toString();
-        return fresh_ && row.value("number").toInt() > 0 && row.value("attachable").toBool()
-            && (phase == "tui_starting" || phase == "tui_ready")
-            && !row.value("slot").toString().isEmpty();
-    }
-    void updateDetail() {
+    void loadSelectedDetail() {
+        ++selectionEpoch_;
         const auto row = selected();
-        open_->setEnabled(canOpen(row) && row.value("slot").toString() != attachedSlot_);
-        QString error = row.value("error_type").toString(QStringLiteral("—"));
-        if (row.value("exit_code").toInt() != 0) {
-            error += QStringLiteral(" (exec exit %1)").arg(row.value("exit_code").toInt());
-        }
-        detail_->setText(row.isEmpty() ? QStringLiteral("Vyber úlohu pro podrobnosti.")
-            : QStringLiteral("TUI stav: %1\nQueue stav: %2\nThread UUID: %3\nPřipojitelná: %4\nChyba: %5")
-                .arg(row.value("phase").toString(), row.value("queue_status").toString("—"),
-                    row.value("thread_id").toString("—"), canOpen(row) ? QStringLiteral("ano (ověří helper)") : QStringLiteral("ne"),
-                    error));
+        verified_ = {};
+        approval_->setChecked(false);
+        task_->clear();
+        header_->setText(row.isEmpty() ? QStringLiteral("Vyber úlohu")
+            : QStringLiteral("#%1 · %2").arg(row.value("number").toInt()).arg(row.value("title").toString()));
+        metadata_->setText(row.isEmpty() ? QString() : QStringLiteral("Projekt: %1 · Stav: %2 · Režim: %3")
+            .arg(row.value("project").toString(), row.value("queue_status").toString(), row.value("mode").toString()));
+        updateAction();
+        if (row.isEmpty() || row.value("number").toInt() <= 0 || !QFileInfo(queueCli()).isFile()) { return; }
+        const int number = row.value("number").toInt();
+        const int epoch = selectionEpoch_;
+        task_->setPlainText(QStringLiteral("Načítám úplné zadání…"));
+        query(queueCli(), {QStringLiteral("gui-detail"), QString::number(number)},
+            [this, number, epoch](bool ok, const QByteArray &bytes) {
+                if (epoch != selectionEpoch_ || selected().value("number").toInt() != number) { return; }
+                const auto doc = QJsonDocument::fromJson(bytes);
+                const auto obj = doc.object();
+                if (!ok || !doc.isObject() || obj.value("number").toInt() != number
+                    || obj.value("digest").toString().size() != 64) {
+                    task_->setPlainText(QStringLiteral("Celé zadání se nepodařilo ověřit proti GitHubu. Schválení není dostupné.\n"
+                        "Zkontroluj název [g2c], stav Issue a lokální Queue."));
+                    verified_ = {};
+                } else {
+                    verified_ = obj;
+                    header_->setText(QStringLiteral("#%1 · %2").arg(number).arg(obj.value("title").toString()));
+                    task_->setPlainText(obj.value("task").toString());
+                    metadata_->setText(QStringLiteral("Projekt: %1 · Stav: %2 · Režim: %3\nSHA-256: %4")
+                        .arg(obj.value("project").toString(), obj.value("status").toString(),
+                             obj.value("mode").toString(), obj.value("digest").toString()));
+                }
+                approval_->setChecked(false);
+                updateAction();
+            });
     }
-    void openSelected() {
-        const auto row = selected();
-        if (!canOpen(row) || row.value("slot").toString() == attachedSlot_) { return; }
-        disconnectTerminal();
-        Gpt2CodexTerminalBackend *provider = nullptr;
-        auto *term = backends_.create(readBackendPreference(), right_, python_,
-            {options_.queueHelper, QStringLiteral("attach"), row.value("slot").toString()},
-            QFileInfo(options_.queueHelper).absolutePath(), provider);
-        if (!term || !provider) {
-            terminalStatus_->setText(QStringLiteral("Terminálový backend není dostupný. Ověř Nastavení.")); return;
-        }
-        terminal_ = term; attachedSlot_ = row.value("slot").toString();
-        static_cast<QVBoxLayout *>(right_->layout())->addWidget(term, 1);
-        connect(term, SIGNAL(terminalFinished()), this, SLOT(terminalFinished()));
-        terminalStatus_->setText(QStringLiteral("TUI: #%1 / %2. Odpojit ukončí pouze klientské připojení.").arg(row.value("number").toInt()).arg(attachedSlot_));
-        detach_->setEnabled(true); updateDetail();
-        provider->start(term);
-        QTimer::singleShot(0, this, [this] { focusTerminal(); });
+    void updateAction() {
+        const bool pending = verified_.value("status").toString() == QStringLiteral("pending")
+            && verified_.value("remote_state").toString() == QStringLiteral("open")
+            && selected().value("number").toInt() == verified_.value("number").toInt()
+            && !acting_;
+        approval_->setEnabled(pending);
+        action_->setEnabled(pending);
+        confirm_->setEnabled(pending && approval_->isChecked());
+    }
+    void performAction() {
+        const auto job = verified_;
+        if (!approval_->isChecked() || acting_ || job.value("status").toString() != QStringLiteral("pending")
+            || selected().value("number").toInt() != job.value("number").toInt()) { return; }
+        const int number = job.value("number").toInt();
+        const auto action = action_->currentData().toString();
+        if (action == QStringLiteral("reject") && QMessageBox::question(this,
+                QStringLiteral("Zamítnout úlohu"),
+                QStringLiteral("Opravdu zamítnout úlohu #%1?").arg(number)) != QMessageBox::Yes) { return; }
+        QStringList args;
+        if (action == QStringLiteral("approve")) {
+            args = {QStringLiteral("gui-approve"), QString::number(number),
+                QStringLiteral("--digest"), job.value("digest").toString(),
+                QStringLiteral("--confirmation"), QStringLiteral("SCHVALUJI %1").arg(number)};
+        } else if (action == QStringLiteral("reject")) {
+            args = {QStringLiteral("reject"), QString::number(number)};
+        } else { return; }
+        acting_ = true;
+        updateAction();
+        query(queueCli(), args, [this](bool ok, const QByteArray &) {
+            acting_ = false;
+            approval_->setChecked(false);
+            verified_ = {};
+            hint_->setText(ok ? QStringLiteral("Operace potvrzena lokálním Queue CLI.")
+                : QStringLiteral("Operace odmítnuta; zkontroluj stav úlohy, přístup ke GitHubu a Queue log."));
+            updateAction();
+            refresh();
+            loadSelectedDetail();
+        });
     }
     Options options_;
-    BackendRegistry &backends_;
-    QString python_, attachedSlot_;
+    QString python_;
     QStringList screenWarnings_;
-    QListWidget *list_;
-    QComboBox *filter_;
-    QLabel *detail_, *hint_, *terminalStatus_;
-    QPushButton *open_, *detach_;
-    QWidget *right_;
-    QPointer<QWidget> terminal_;
+    QListWidget *list_ = nullptr;
+    QComboBox *filter_ = nullptr, *action_ = nullptr;
+    QLabel *header_ = nullptr, *metadata_ = nullptr, *hint_ = nullptr;
+    QPlainTextEdit *task_ = nullptr;
+    QCheckBox *approval_ = nullptr;
+    QPushButton *confirm_ = nullptr;
+    QJsonObject verified_;
     QTimer timer_;
-    bool busy_ = false, fresh_ = false;
+    int selectionEpoch_ = 0;
+    bool busy_ = false, acting_ = false;
 };
 
+// Queue Codex runs via `codex exec --json`, not an interactive TUI.  This
+// project tab displays only sanitized event *categories* from the local queue
+// metadata API. It never attaches to screen, accesses raw output or starts work.
+class QueueActivityPage final : public QWidget {
+    Q_OBJECT
+public:
+    explicit QueueActivityPage(int issue, QWidget *parent = nullptr)
+        : QWidget(parent), number_(issue) {
+        setObjectName(QStringLiteral("queueActivityPage"));
+        auto *layout = new QVBoxLayout(this);
+        header_ = new QLabel(this);
+        header_->setObjectName(QStringLiteral("queueActivityHeader"));
+        header_->setWordWrap(true);
+        layout->addWidget(header_);
+        state_ = new QLabel(this);
+        state_->setObjectName(QStringLiteral("queueActivityState"));
+        state_->setWordWrap(true);
+        state_->setTextFormat(Qt::PlainText);
+        layout->addWidget(state_);
+        events_ = new QPlainTextEdit(this);
+        events_->setObjectName(QStringLiteral("queueActivityEvents"));
+        events_->setReadOnly(true);
+        events_->setPlaceholderText(QStringLiteral("Čekám na první události Codexu…"));
+        layout->addWidget(events_, 1);
+        auto *note = new QLabel(QStringLiteral("Pouze typy událostí. Příkazy, výstupy, prompty a obsah souborů se nezobrazují."), this);
+        note->setWordWrap(true);
+        layout->addWidget(note);
+    }
+    int number() const { return number_; }
+    QString project() const { return project_; }
+    QString title() const { return title_; }
+    void update(const QJsonObject &obj) {
+        if (obj.value("number").toInt() != number_) { return; }
+        project_ = obj.value("project").toString();
+        title_ = obj.value("title").toString();
+        header_->setText(QStringLiteral("#%1 · %2\nProjekt: %3")
+            .arg(number_).arg(title_, project_));
+        const QString phase = obj.value("phase").toString("unverified");
+        const QHash<QString, QString> phaseNames{
+            {QStringLiteral("claim_pending"), QStringLiteral("Příprava spuštění")},
+            {QStringLiteral("issue_accepted"), QStringLiteral("Úloha převzata")},
+            {QStringLiteral("exec_starting"), QStringLiteral("Spouštění Codexu")},
+            {QStringLiteral("turn_running"), QStringLiteral("Codex zpracovává úlohu")},
+            {QStringLiteral("turn_finished"), QStringLiteral("Zpracování skončilo")},
+            {QStringLiteral("unverified"), QStringLiteral("Stav nelze ověřit")},
+        };
+        const QString runtime = obj.value("runtime_verified").toBool()
+            ? QStringLiteral("Ověřeno okno / screen server; proces Codexu se samostatně neověřuje")
+            : QStringLiteral("Runtime neověřen; stav Queue sám o sobě nedokazuje běh Codexu");
+        state_->setText(QStringLiteral("Queue: %1 · Backend: %2 · Fáze: %3\n%4 · Turn: %5/%6")
+            .arg(obj.value("queue_status").toString(), obj.value("backend").toString(), phaseNames.value(phase, phase), runtime)
+            .arg(obj.value("turns_completed").toInt()).arg(obj.value("turns_started").toInt()));
+        QStringList entries;
+        for (const QJsonValue &value : obj.value("events").toArray()) {
+            if (value.isString()) { entries << value.toString(); }
+        }
+        const QString content = entries.join('\n');
+        if (events_->toPlainText() != content) { events_->setPlainText(content); }
+    }
+private:
+    int number_;
+    QString project_, title_;
+    QLabel *header_ = nullptr, *state_ = nullptr;
+    QPlainTextEdit *events_ = nullptr;
+};
 
 class MainWindow final : public QMainWindow {
 public:
@@ -1386,10 +1615,8 @@ public:
         });
         connect(tabs_, &QTabWidget::currentChanged, this, [this](int index) {
             if (pasteAction_) {
-                pasteAction_->setEnabled(tabs_->widget(index) == queuePage_
-                    || qobject_cast<SessionPage *>(tabs_->widget(index)) != nullptr);
+                pasteAction_->setEnabled(qobject_cast<SessionPage *>(tabs_->widget(index)) != nullptr);
             }
-            if (tabs_->widget(index) == queuePage_) { queuePage_->focusTerminal(); }
             auto *page = qobject_cast<SessionPage *>(tabs_->widget(index));
             if (page) {
                 QTimer::singleShot(0, page, [this, page] {
@@ -1398,12 +1625,19 @@ public:
             }
         });
         connect(tabs_, &QTabWidget::tabCloseRequested, this, [this](int index) {
-            if (index <= 0) { return; } // The Bridge tab is pinned.
+            if (index <= 0) { return; } // The Queue Worker tab is pinned.
             auto *page = tabs_->widget(index);
+            if (page == queuePage_) { return; } // The operator inbox is pinned.
             if (page == settingsPage_) {
                 settingsPage_ = nullptr;
                 tabs_->removeTab(index);
                 page->deleteLater();
+                return;
+            }
+            if (auto *activity = qobject_cast<QueueActivityPage *>(page)) {
+                hiddenQueueActivity_.insert(activity->number());
+                removeQueueActivityPage(activity->number());
+                statusBar()->showMessage(QStringLiteral("Pohled skryt; Queue Codex pokračuje."), 5000);
                 return;
             }
             const QString id = pages_.key(page);
@@ -1426,7 +1660,9 @@ public:
         auto *restoreAction = tools->addAction(QStringLiteral("Zobrazit skryté záložky"));
         connect(restoreAction, &QAction::triggered, this, [this] {
             hidden_.clear();
+            hiddenQueueActivity_.clear();
             refreshSessions();
+            refreshQueueActivity();
         });
         auto *quitAction = tools->addAction(QStringLiteral("Ukončit pouze GUI"));
         connect(quitAction, &QAction::triggered, this, [this] { quitGui(); });
@@ -1434,7 +1670,7 @@ public:
         connect(detachAction, &QAction::triggered, this, [this] {
             if (auto *page = qobject_cast<SessionPage *>(tabs_->currentWidget())) {
                 page->disconnectTerminal();
-            } else if (tabs_->currentWidget() == queuePage_) { queuePage_->disconnectTerminal(); }
+            }
         });
 
         // Embedded KParts do not inherit a standalone Konsole main window's
@@ -1445,10 +1681,10 @@ public:
         pasteAction_->setShortcuts({QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V),
                                     QKeySequence(Qt::SHIFT | Qt::Key_Insert)});
         pasteAction_->setShortcutContext(Qt::WindowShortcut);
+        pasteAction_->setEnabled(false);
         new PasteShortcutFilter(this, [this](QWidget *target) {
             auto *page = qobject_cast<SessionPage *>(tabs_->currentWidget());
-            return (page && page->containsTerminal(target))
-                || (tabs_->currentWidget() == queuePage_ && queuePage_->containsTerminal(target));
+            return page && page->containsTerminal(target);
         }, [this] { pasteAction_->trigger(); });
         connect(pasteAction_, &QAction::triggered, this, [this] {
             const QMimeData *mime = QGuiApplication::clipboard()->mimeData(QClipboard::Clipboard);
@@ -1457,8 +1693,7 @@ public:
                 return;
             }
             auto *page = qobject_cast<SessionPage *>(tabs_->currentWidget());
-            const bool pasted = page ? page->pasteClipboardText()
-                : tabs_->currentWidget() == queuePage_ && queuePage_->pasteClipboardText();
+            const bool pasted = page && page->pasteClipboardText();
             if (!pasted) {
                 statusBar()->showMessage(QStringLiteral("Terminál neumožnil vložení. Ověř backend a připojení relace."), 7000);
             }
@@ -1494,9 +1729,16 @@ public:
         } else {
             statusBar()->showMessage(QStringLiteral("System tray není dostupná; zavření GUI nezastaví screen."));
         }
-        const Session bridge{QStringLiteral("bridge"), QStringLiteral("g2c-bridge"),
-            QStringLiteral("unknown"), QStringLiteral("-"), QStringLiteral("Bridge")};
-        addPage(bridge);
+        const QString workerLogDir = options_.queueRepoRoot.isEmpty()
+            ? QString() : QDir(options_.queueRepoRoot).filePath(QStringLiteral(".log/github-queue"));
+        workerPage_ = new g2cworker::QueueWorkerPage(workerLogDir, tabs_,
+#ifdef G2C_GUI_TEST
+            false
+#else
+            true
+#endif
+        );
+        tabs_->addTab(workerPage_, QIcon::fromTheme("system-run"), QStringLiteral("Queue Worker"));
         tabs_->tabBar()->setTabButton(0, QTabBar::LeftSide, nullptr);
         tabs_->tabBar()->setTabButton(0, QTabBar::RightSide, nullptr);
         const int queueIndex = tabs_->addTab(queuePage_, QStringLiteral("GitHub Queue"));
@@ -1507,6 +1749,10 @@ public:
         connect(&refreshTimer_, &QTimer::timeout, this, [this] { refreshSessions(); });
         refreshTimer_.start();
         QTimer::singleShot(0, this, [this] { refreshSessions(); });
+        queueActivityTimer_.setInterval(3500);
+        connect(&queueActivityTimer_, &QTimer::timeout, this, [this] { refreshQueueActivity(); });
+        queueActivityTimer_.start();
+        QTimer::singleShot(0, this, [this] { refreshQueueActivity(); });
         attentionTimer_.setInterval(1000);
         connect(&attentionTimer_, &QTimer::timeout, this, [this] {
             for (const QString &slot : attention_.expire(attentionClock_.elapsed())) {
@@ -1519,6 +1765,15 @@ public:
     void showQueueTasks() { tabs_->setCurrentWidget(queuePage_); }
 
     ~MainWindow() override {
+        if (queueActivityQuery_) {
+            auto *proc = queueActivityQuery_;
+            queueActivityQuery_ = nullptr;
+            disconnect(proc, nullptr, this, nullptr);
+            if (proc->state() != QProcess::NotRunning) {
+                proc->kill();
+                proc->waitForFinished(1000);
+            }
+        }
         attentionSource_->setBindingsChanged({});
         for (auto it = pages_.cbegin(); it != pages_.cend(); ++it) { attentionSource_->unwatch(attention_.ticket(it.key())); }
     }
@@ -1547,6 +1802,94 @@ protected:
     }
 
 private:
+    void removeQueueActivityPage(int number) {
+        auto *page = queueActivityPages_.take(number);
+        if (!page) { return; }
+        const int index = tabs_->indexOf(page);
+        if (index >= 0) { tabs_->removeTab(index); }
+        page->deleteLater(); // This is only a read-only GUI widget.
+    }
+
+    void applyQueueActivity(const QByteArray &raw) {
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isArray()) { return; }  // Keep existing views on transient read errors.
+        QSet<int> visible;
+        QList<QJsonObject> rows;
+        for (const QJsonValue &value : doc.array()) {
+            if (!value.isObject()) { return; }
+            const QJsonObject obj = value.toObject();
+            const int number = obj.value("number").toInt(-1);
+            const QString project = obj.value("project").toString();
+            if (number <= 0 || !QRegularExpression(QStringLiteral("^[a-zA-Z0-9_-]{1,64}$"))
+                    .match(project).hasMatch() || obj.value("queue_status").toString() != QStringLiteral("running")
+                || visible.contains(number)) { return; }
+            visible.insert(number);
+            rows.append(obj);
+        }
+        const QList<int> known = queueActivityPages_.keys();
+        for (int number : known) {
+            if (!visible.contains(number)) { removeQueueActivityPage(number); }
+        }
+        for (const QJsonObject &obj : rows) {
+            const int number = obj.value("number").toInt();
+            if (hiddenQueueActivity_.contains(number)) { continue; }
+            auto *page = queueActivityPages_.value(number, nullptr);
+            if (!page) {
+                page = new QueueActivityPage(number, tabs_);
+                queueActivityPages_.insert(number, page);
+                const int queueIndex = tabs_->indexOf(queuePage_);
+                const int index = tabs_->insertTab(queueIndex < 0 ? tabs_->count() : queueIndex,
+                    page, obj.value("project").toString());
+                tabs_->setTabIcon(index, QIcon::fromTheme(QStringLiteral("system-run")));
+            }
+            page->update(obj);
+            const int index = tabs_->indexOf(page);
+            if (index >= 0) {
+                tabs_->setTabText(index, page->project());
+                tabs_->setTabToolTip(index, QStringLiteral("#%1 · %2").arg(number).arg(page->title()));
+            }
+        }
+    }
+
+    void refreshQueueActivity() {
+        if (queueActivityQuery_ || options_.queueHelper.isEmpty()
+            || !options_.queueRootError.isEmpty()) { return; }
+        const QString python = QStandardPaths::findExecutable(QStringLiteral("python3"));
+        const QString script = QFileInfo(options_.queueHelper).dir()
+            .filePath(QStringLiteral("gpt2codex-github-queue.py"));
+        if (python.isEmpty() || !QFileInfo(script).isFile()) { return; }
+        auto *proc = new QProcess(this);
+        queueActivityQuery_ = proc;
+        proc->setProcessChannelMode(QProcess::SeparateChannels);
+        connect(proc, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+            [this, proc](int code, QProcess::ExitStatus status) {
+                if (queueActivityQuery_ != proc) { return; }
+                queueActivityQuery_ = nullptr;
+                const QByteArray payload = proc->readAllStandardOutput();
+                proc->deleteLater();
+                if (code == 0 && status == QProcess::NormalExit && payload.size() <= 256 * 1024) {
+                    applyQueueActivity(payload);
+                }
+            });
+        connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError) {
+            if (queueActivityQuery_ != proc) { return; }
+            queueActivityQuery_ = nullptr;
+            proc->deleteLater();
+        });
+        QStringList args{QStringLiteral("-B"), script};
+        if (!options_.queueConfig.isEmpty()) {
+            args << QStringLiteral("--config") << options_.queueConfig;
+        }
+        if (!options_.queueRepoRoot.isEmpty()) {
+            args << QStringLiteral("--repo-root") << options_.queueRepoRoot;
+        }
+        args << QStringLiteral("gui-activity");
+        proc->start(python, args);
+        QTimer::singleShot(18000, proc, [tracked = QPointer<QProcess>(proc)] {
+            if (tracked && tracked->state() != QProcess::NotRunning) { tracked->kill(); }
+        });
+    }
+
     // These callbacks have presentation authority only. They cannot attach,
     // detach, refresh session discovery, launch a program or answer approvals.
     void presentPage(SessionPage *page) {
@@ -1592,6 +1935,8 @@ private:
             QHash<QString, QString> roots;
             if (!ok || *failed || !g2ctabs::parseProjectRoots(*data, roots)) { roots.clear(); }
             tabPresentation_.setRoots(roots);
+            // Worker logs belong to the Queue checkout selected from the Queue
+            // config, not an unrelated Rust session/project discovery result.
             updateTabPresentations();
             proc->deleteLater();
         };
@@ -1691,6 +2036,19 @@ private:
         }
     }
 
+    void removeSessionPage(const QString &key) {
+        auto it = pages_.find(key);
+        if (it == pages_.end()) { return; }
+        auto *page = static_cast<SessionPage *>(it.value());
+        attentionSource_->unwatch(attention_.ticket(key));
+        attention_.remove(key);
+        const int index = tabs_->indexOf(page);
+        if (index >= 0) { tabs_->removeTab(index); }
+        pages_.erase(it);
+        hidden_.remove(key);
+        page->deleteLater(); // Disconnects only the transient client; never signals the screen server.
+    }
+
     void refreshSessions() {
         refreshProjectRoots();
         if (query_) { return; }
@@ -1721,49 +2079,46 @@ private:
                     return;
                 }
                 int running = 0;
-                // Keep existing presentation on config failure. Never infer an empty allowlist.
-                if (allowOk) {
-                    for (auto *widget : pages_) {
-                        auto *page = static_cast<SessionPage *>(widget);
-                        const int index = tabs_->indexOf(page);
-                        if (index >= 0) { tabs_->setTabVisible(index,
-                            page->session().id == "bridge" || allowed.contains(page->session().id)); }
-                    }
-                }
-                QSet<QString> registered;
-                for (const auto &session : sessions) {
-                    if (session.state != "not_registered") { registered.insert(session.id); }
-                }
+                QSet<QString> seenActive;
                 for (const Session &session : sessions) {
-                    const bool permitted = session.id == "bridge" || (allowOk && allowed.contains(session.id));
-                    if (!permitted && (allowOk || !pages_.contains(session.key()))) { continue; }
-                    if (session.running()) { ++running; }
-                    if (hidden_.contains(session.key())) { continue; }
-                    if (!pages_.contains(session.key())) {
-                        if (session.state == "not_registered"
-                            && (session.multiplexer != "screen" || registered.contains(session.id))) { continue; }
+                    // Bridge's old interactive tab was replaced by the pinned Queue Worker monitor.
+                    if (session.id == QStringLiteral("bridge")) { continue; }
+                    const QString key = session.key();
+                    const bool activeCodex = session.hasCodexView();
+                    const bool permitted = allowOk && allowed.contains(session.id);
+                    if (!activeCodex) {
+                        removeSessionPage(key);
+                        continue;
+                    }
+                    if (!permitted) {
+                        if (allowOk) {
+                            removeSessionPage(key);
+                        } else if (pages_.contains(key)) {
+                            // Keep the count aligned with verified views retained while the allowlist is unavailable.
+                            ++running;
+                        }
+                        continue; // On allowlist read failure, preserve an existing verified view only.
+                    }
+                    ++running;
+                    seenActive.insert(key);
+                    if (hidden_.contains(key)) { continue; }
+                    if (!pages_.contains(key)) {
                         addPage(session);
                     } else {
-                        auto *page = static_cast<SessionPage *>(pages_.value(session.key()));
+                        auto *page = static_cast<SessionPage *>(pages_.value(key));
                         page->update(session);
                         const int index = tabs_->indexOf(page);
-                        if (index >= 0) {
-                            syncAttention(page);
-                        }
+                        if (index >= 0) { syncAttention(page); }
                     }
                 }
-                if (initialBridgeSelection_) {
-                    initialBridgeSelection_ = false;
-                    QWidget *first = tabs_->widget(0);
-                    const bool selectedPlaceholder = tabs_->currentWidget() == first;
-                    QWidget *bridge = pages_.value(startupBridgeKey(sessions));
-                    const int index = tabs_->indexOf(bridge);
-                    if (index > 0) {
-                        tabs_->tabBar()->moveTab(index, 0);
-                        if (selectedPlaceholder) { tabs_->setCurrentWidget(bridge); }
+                // A malformed/omitted row must not leave an obsolete project tab visible.
+                if (allowOk) {
+                    const auto keys = pages_.keys();
+                    for (const QString &key : keys) {
+                        if (!seenActive.contains(key)) { removeSessionPage(key); }
                     }
                 }
-                statusBar()->showMessage(QStringLiteral("Ověřené registrované relace: %1 dostupných · cizí screeny a Queue se nezapočítávají. CLI: %2 · config: %3")
+                statusBar()->showMessage(QStringLiteral("Ověřené Codex relace: %1 · anchor-only a neaktivní projekty jsou skryté. CLI: %2 · config: %3")
                     .arg(running).arg(options_.bridgeCli, options_.config.isEmpty() ? defaultBridgeConfig() : options_.config));
             });
         connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError) {
@@ -1806,12 +2161,16 @@ private:
     QAction *pasteAction_ = nullptr;
     SettingsPage *settingsPage_ = nullptr;
     QueuePage *queuePage_ = nullptr;
+    g2cworker::QueueWorkerPage *workerPage_ = nullptr;
     QLabel *allowlistProblem_ = nullptr;
     QHash<QString, QWidget *> pages_;
     QSet<QString> hidden_;
+    QHash<int, QueueActivityPage *> queueActivityPages_;
+    QSet<int> hiddenQueueActivity_;
+    QTimer queueActivityTimer_;
+    QProcess *queueActivityQuery_ = nullptr;
     QSystemTrayIcon *tray_ = nullptr;
     QTimer refreshTimer_;
-    bool initialBridgeSelection_ = true;
     QProcess *query_ = nullptr;
     QProcess *rootsQuery_ = nullptr;
     g2ctabs::Presentation tabPresentation_;
