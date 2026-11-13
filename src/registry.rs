@@ -54,10 +54,33 @@ struct GlobalConfig {
 #[serde(deny_unknown_fields)]
 struct WorkspaceConfig {
     project_dir: PathBuf,
+    #[serde(default = "default_temp_base")]
+    temp_base: PathBuf,
     #[serde(default = "default_rules_dir")]
     rules_dir: PathBuf,
     #[serde(default = "default_global_files")]
     global_context_files: Vec<PathBuf>,
+}
+
+fn default_temp_base() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+fn validate_temp_base_path(base: &Path) -> Result<()> {
+    if !base.is_absolute() || base.components().any(|part|
+        matches!(part, Component::ParentDir | Component::CurDir)) {
+        return Err(RegistryError("workspace.temp_base must be an absolute normalized path"));
+    }
+    Ok(())
+}
+
+/// Existing installations keep /tmp until an operator configures another base.
+pub fn configured_temp_base(config_path: &Path) -> Result<PathBuf> {
+    if !config_path.exists() { return Ok(default_temp_base()); }
+    let raw = read_small_utf8(config_path, MAX_CONFIG_BYTES)?;
+    let config: GlobalConfig = toml::from_str(&raw).map_err(|_| RegistryError("invalid global TOML"))?;
+    validate_temp_base_path(&config.workspace.temp_base)?;
+    Ok(config.workspace.temp_base)
 }
 
 fn default_rules_dir() -> PathBuf {
@@ -209,6 +232,7 @@ pub struct Project {
 #[derive(Debug)]
 pub struct ProjectRegistry {
     pub project_dir: PathBuf,
+    pub temp_base: PathBuf,
     pub rules_dir: PathBuf,
     pub global_files: Vec<PathBuf>,
     pub git_user_name: Option<String>,
@@ -430,6 +454,7 @@ impl ProjectRegistry {
         if !config.workspace.project_dir.is_absolute() {
             return Err(RegistryError("project_dir must be absolute"));
         }
+        validate_temp_base_path(&config.workspace.temp_base)?;
         if fs::symlink_metadata(&config.workspace.project_dir)
             .map_err(|_| RegistryError("project_dir unavailable"))?
             .file_type()
@@ -530,7 +555,8 @@ impl ProjectRegistry {
                 return Err(RegistryError("duplicate project id"));
             }
         }
-        Ok(Self { project_dir, rules_dir, global_files: config.workspace.global_context_files,
+        Ok(Self { project_dir, temp_base: config.workspace.temp_base,
+            rules_dir, global_files: config.workspace.global_context_files,
             git_user_name: config.git.user_name, git_user_email: config.git.user_email, projects })
     }
 

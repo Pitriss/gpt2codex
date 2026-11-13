@@ -33,7 +33,7 @@ class CITests(unittest.TestCase):
 
     def test_application_packaging_workflow_and_runtime_config_are_relevant(self):
         for path in ['src/main.rs','gui/main.cpp','tests/fixtures/mock_app_server.py','Cargo.lock','.cargo/config.toml',
-                     'debian/control','packaging/ci-lock.json','gpt2codex-alpha-container.sh','.github/workflows/alpha.yml',
+                     'debian/control','packaging/ci-lock.json','gpt2codex-alpha-container.sh','.github/workflows/release.yml',
                      '.ai/templates/CODEX_GLOBAL.md','.ai/examples/config.toml','CMakeLists.txt','unknown.cfg']:
             with self.subTest(path=path):
                 result=ci.plan('push','refs/heads/main',{},[path]);self.assertTrue(result['full'])
@@ -51,7 +51,7 @@ class CITests(unittest.TestCase):
             self.assertEqual([r['arch'] for r in result['matrix']['include']],['amd64','arm64','armhf'])
 
     def test_release_tag_always_requests_complete_candidate_even_for_docs(self):
-        result=ci.plan('push',ci.RELEASE_REF,{},['README.md'])
+        result=ci.plan('push','refs/tags/v0.1.0',{},['README.md'])
         self.assertTrue(result['full']);self.assertTrue(result['arm']);self.assertTrue(result['candidate'])
         self.assertFalse(result['devuan'])
         self.assertFalse(result['matrix']['include'][0]['experimental'])
@@ -86,9 +86,9 @@ class CITests(unittest.TestCase):
         self.assertTrue(ci.cache_allowed('push','refs/heads/main','main'))
         self.assertTrue(ci.cache_allowed('workflow_dispatch','refs/heads/main','main'))
         for event,ref in [('pull_request','refs/pull/1/merge'),('pull_request','refs/heads/main'),
-                          ('push',ci.RELEASE_REF),('push','refs/heads/feature'),('workflow_dispatch',ci.RELEASE_REF)]:
+                          ('push','refs/tags/v0.1.0'),('push','refs/heads/feature'),('workflow_dispatch','refs/tags/v0.1.0')]:
             self.assertFalse(ci.cache_allowed(event,ref,'main'))
-        workflow=(ROOT/'.github/workflows/alpha.yml').read_text()
+        workflow=(ROOT/'.github/workflows/release.yml').read_text()
         self.assertNotIn('pull_request_target:',workflow)
         self.assertNotIn('restore-keys:',workflow)
         guard="(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
@@ -141,6 +141,7 @@ class CITests(unittest.TestCase):
         self.assertIn('cargo test --frozen --all-targets',container)
         self.assertIn('python3 ./gpt2codex-alpha-test.py\n',container)
         self.assertIn('python3 ./gpt2codex-alpha-test.py --light',container)
+        self.assertIn('python3 -B ./gpt2codex-project-types-test.py',container)
 
     def test_plan_cli_outputs_boolean_and_matrix_values_for_github(self):
         event=self.base/'event.json';event.write_text('{"inputs":{}}');output=self.base/'outputs'
@@ -167,7 +168,7 @@ class CITests(unittest.TestCase):
         self.assertNotEqual(cp.returncode,0);self.assertIn('non-isolated',cp.stderr)
 
     def workflow_python(self, job, marker):
-        text=(ROOT/'.github/workflows/alpha.yml').read_text().split('\n  '+job+':\n',1)[1]
+        text=(ROOT/'.github/workflows/release.yml').read_text().split('\n  '+job+':\n',1)[1]
         text=text.split(marker,1)[1].split("python3 - <<'PY'\n",1)[1].split('\n          PY',1)[0]
         return '\n'.join(line[10:] if line.startswith('          ') else line for line in text.splitlines())
 
@@ -187,7 +188,7 @@ class CITests(unittest.TestCase):
     def test_optional_job_reports_failure_until_real_matching_receipt_exists(self):
         script=self.workflow_python('devuan','- id: result')
         work=self.base/'job';work.mkdir();(work/'smoke').mkdir();(work/'input/validated').mkdir(parents=True)
-        deb=work/'input/validated/gpt2codex_0.1.0~alpha1_amd64.deb';deb.write_bytes(b'synthetic candidate')
+        deb=work/('input/validated/gpt2codex_'+packaging.alpha.VERSION+'_amd64.deb');deb.write_bytes(b'synthetic candidate')
         import hashlib
         for report,expected in [({'status':'FAIL'},'FAIL'),({'status':'PASS','sha256':'wrong'},'FAIL'),
                                 ({'status':'PASS','sha256':hashlib.sha256(deb.read_bytes()).hexdigest()},'PASS')]:

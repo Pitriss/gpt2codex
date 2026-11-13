@@ -1,12 +1,14 @@
-# gpt2codex — alpha preparation
+# gpt2codex
 
 Local Rust bridge and optional Qt6 GUI for explicitly registered projects and
 persistent Codex terminals. GNU screen is the default multiplexer; tmux is an
 optional per-project preference. Konsole KPart and QTermWidget are independent
 terminal backends. Codex is supplied separately by the operator.
 
-The first Debian package candidate is **0.1.0~alpha1** (future tag
-`v0.1.0-alpha1`). Publication has not been approved. ARM builds and clean
+The target first stable Debian package is **0.1.0** (tag `v0.1.0`).
+A pushed stable tag starts isolated Debian package builds and release tests.
+Publication happens only after mandatory checks and the configured
+GitHub environment and RELEASE_PUBLISH_ENABLED gate. ARM builds and clean
 Debian/Devuan install compatibility must be evaluated from actual CI results;
 source availability alone does not establish support.
 
@@ -42,7 +44,7 @@ multiplexer server is started by the icon/build tests.
 
 Debian packaging, exact CI image/action/archive pins, dependency policy,
 clean install tests and the separate release approval gate are described in
-[alpha packaging](.ai/ALPHA_PACKAGING.md). Do not run Debian clean/build targets
+[packaging and CI](.ai/PLATFORMS_CI.md). Do not run Debian clean/build targets
 in a valuable dirty checkout; stage the current files in an isolated tree.
 
 ## Configuration and operator use
@@ -62,7 +64,7 @@ remains available. Read-only `--backend-probe` reports actual usability.
 
 Read [AGENTS.md](AGENTS.md) and [.ai/README.md](.ai/README.md). Sources may be
 untracked in the current local preparation; preserve the actual worktree.
-The explicit first-commit candidate inventory is
+The historic alpha candidate inventory is
 [ALPHA_COMMIT_FILES.md](.ai/ALPHA_COMMIT_FILES.md). Runtime logs, local configs,
 session registries, caches and the private handoff are excluded.
 

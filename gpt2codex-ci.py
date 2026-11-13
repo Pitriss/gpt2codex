@@ -14,7 +14,10 @@ import tarfile
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
-RELEASE_REF = 'refs/tags/v0.1.0-alpha1'
+RELEASE_TAG_RE = re.compile(r'^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$')
+
+def is_release_ref(ref):
+    return isinstance(ref, str) and RELEASE_TAG_RE.fullmatch(ref) is not None
 
 
 def docs_only(paths):
@@ -36,7 +39,7 @@ def docs_only(paths):
 
 
 def plan(event_name, ref, event, paths):
-    release=event_name=='push' and ref==RELEASE_REF
+    release=event_name=='push' and is_release_ref(ref)
     manual=event_name=='workflow_dispatch'
     full=release or manual or not docs_only(paths)
     arm=release or manual
@@ -175,7 +178,7 @@ def static_checks(actionlint):
             shell='bash' if 'bash' in p.read_text().splitlines()[0] else 'sh'
             subprocess.run([shell,'-n',str(p)],check=True)
     subprocess.run(['yamllint','-d','{extends: relaxed, rules: {line-length: disable}}',str(ROOT/'.github/workflows')],check=True)
-    subprocess.run([str(actionlint),str(ROOT/'.github/workflows/alpha.yml')],check=True)
+    subprocess.run([str(actionlint),str(ROOT/'.github/workflows/release.yml')],check=True)
 
 
 def install_actionlint(destination):
@@ -204,7 +207,7 @@ def main():
             if not isinstance(event,dict):event={}
         except (OSError,ValueError):event={}
         name=os.environ['GITHUB_EVENT_NAME'];ref=os.environ['GITHUB_REF']
-        paths=changed_paths(name,event,os.environ['GITHUB_REPOSITORY']) if name in {'push','pull_request'} and ref!=RELEASE_REF else None
+        paths=changed_paths(name,event,os.environ['GITHUB_REPOSITORY']) if name in {'push','pull_request'} and not is_release_ref(ref) else None
         result=plan(name,ref,event,paths)
         lock=json.loads((ROOT/'packaging/ci-lock.json').read_text())
         result.update({key:lock['images'][key]['image'] for key in ['debian','binfmt']})

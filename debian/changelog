@@ -1,3 +1,11 @@
+gpt2codex (0.1.0) unstable; urgency=medium
+
+  * First stable 0.1.0 release.
+  * Retain Rust/Qt6 backends and Debian 13 package validation.
+  * Preserve operator-controlled session and project lifecycle.
+
+ -- Pitriss <5106460+Pitriss@users.noreply.github.com>  Fri, 13 Nov 2026 11:13:48 +0000
+
 gpt2codex (0.1.0~alpha1) unstable; urgency=medium
 
   * First local alpha packaging candidate; publication requires approval.

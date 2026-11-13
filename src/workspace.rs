@@ -244,33 +244,157 @@ fn expected_link_status(root: &Path, id: &str, temp_base: &Path, kind: &str) -> 
 fn check_tmp_base(temp_base: &Path) -> Result<()> {
     if !temp_base.is_absolute() { return Err(error("temporary base must be absolute")); }
     let meta = fs::symlink_metadata(temp_base).map_err(|e| io_error("temporary base unavailable", e))?;
-    if meta.file_type().is_symlink() || !meta.is_dir() || (meta.mode() & 0o1000) == 0 {
-        return Err(error("temporary base must be a real sticky directory"));
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(error("temporary base must be a real directory"));
+    }
+    // Keep the historical check for public /tmp only. Other locations are
+    // operator-managed: never enforce their owner or permissions.
+    if temp_base == Path::new("/tmp") && (meta.mode() & 0o1000) == 0 {
+        return Err(error("the default /tmp must have its sticky bit"));
+    }
+    Ok(())
+}
+
+fn storage_kinds(temp_base: &Path) -> &'static [&'static str] {
+    if temp_base == Path::new("/tmp") { &["tmp", "log"] }
+    else { &["tmp", "log", "rel"] }
+}
+
+fn storage_directory_state(path: &Path, temp_base: &Path) -> Result<bool> {
+    if temp_base == Path::new("/tmp") { return check_directory(path, true); }
+    match lstat(path)? {
+        None => Ok(false),
+        Some(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(true),
+        Some(_) => Err(error(format!("workspace storage is not a directory: {}", path.display()))),
+    }
+}
+
+fn create_storage_directory(path: &Path, temp_base: &Path) -> Result<()> {
+    if temp_base == Path::new("/tmp") { return create_private_dir(path); }
+    if storage_directory_state(path, temp_base)? { return Ok(()); }
+    // Use the OS umask for new directories, do not chmod/chown existing ones.
+    match fs::create_dir(path) {
+        Ok(()) => (),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(err) => return Err(io_error("cannot create workspace storage directory", err)),
+    }
+    if !storage_directory_state(path, temp_base)? {
+        return Err(error("workspace storage directory was not created"));
     }
     Ok(())
 }
 
 fn tmp_directory_state(temp_base: &Path, id: &str) -> Result<bool> {
     let base = temp_base.join(id);
-    if !check_directory(&base, true)? { return Ok(false); }
-    for kind in ["tmp", "log"] {
-        if !check_directory(&base.join(kind), true)? { return Ok(false); }
+    if !storage_directory_state(&base, temp_base)? { return Ok(false); }
+    for kind in storage_kinds(temp_base) {
+        if !storage_directory_state(&base.join(kind), temp_base)? { return Ok(false); }
     }
     Ok(true)
 }
 
 fn ensure_tmp_directory(temp_base: &Path, id: &str) -> Result<()> {
     check_tmp_base(temp_base)?;
-    create_private_dir(&temp_base.join(id))?;
-    create_private_dir(&temp_base.join(id).join("tmp"))?;
-    create_private_dir(&temp_base.join(id).join("log"))?;
+    let base = temp_base.join(id);
+    create_storage_directory(&base, temp_base)?;
+    for kind in storage_kinds(temp_base) {
+        create_storage_directory(&base.join(kind), temp_base)?;
+    }
+    Ok(())
+}
+
+fn legacy_link(root: &Path, id: &str, temp_base: &Path, kind: &str) -> Result<bool> {
+    if temp_base == Path::new("/tmp") { return Ok(false); }
+    let link = root.join(format!(".{kind}"));
+    Ok(lstat(&link)?.is_some_and(|m| m.file_type().is_symlink())
+        && fs::read_link(&link).map_err(|e| io_error("cannot read workspace link", e))?
+            == Path::new("/tmp").join(id).join(kind))
+}
+
+fn preflight_link(root: &Path, id: &str, temp_base: &Path, kind: &str) -> Result<()> {
+    match expected_link_status(root, id, temp_base, kind) {
+        Ok(_) => Ok(()),
+        Err(_) if legacy_link(root, id, temp_base, kind)? => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+// Copy missing legacy files only. Existing new files are retained and old
+// originals are never removed; collisions remain accessible in the old tree.
+fn copy_missing_tree(src: &Path, dst: &Path, copied: &mut u64, existing: &mut u64, transient: &mut u64) -> Result<()> {
+    let src_meta = fs::symlink_metadata(src).map_err(|e| io_error("cannot inspect legacy data", e))?;
+    if !src_meta.is_dir() || src_meta.file_type().is_symlink() {
+        return Err(error(format!("legacy source is not a directory: {}", src.display())));
+    }
+    for entry in fs::read_dir(src).map_err(|e| io_error("cannot list legacy data", e))? {
+        let entry = entry.map_err(|e| io_error("cannot read legacy entry", e))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let from_meta = fs::symlink_metadata(&from).map_err(|e| io_error("cannot inspect legacy entry", e))?;
+        let destination = lstat(&to)?;
+        if from_meta.is_dir() && !from_meta.file_type().is_symlink() {
+            if destination.is_none() {
+                DirBuilder::new().mode(from_meta.mode() & 0o777).create(&to)
+                    .map_err(|e| io_error("cannot create migrated directory", e))?;
+            } else if !destination.as_ref().is_some_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+                *existing += 1;
+                continue;
+            }
+            copy_missing_tree(&from, &to, copied, existing, transient)?;
+        } else if destination.is_some() {
+            *existing += 1;
+        } else if from_meta.file_type().is_symlink() {
+            symlink(fs::read_link(&from).map_err(|e| io_error("cannot read legacy symlink", e))?, &to)
+                .map_err(|e| io_error("cannot copy legacy symlink", e))?;
+            *copied += 1;
+        } else if from_meta.is_file() {
+            fs::copy(&from, &to).map_err(|e| io_error("cannot copy legacy file", e))?;
+            *copied += 1;
+        } else {
+            *transient += 1;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_data(root: &Path, id: &str, temp_base: &Path) -> Result<()> {
+    if temp_base == Path::new("/tmp") { return Ok(()); }
+    let mut copied = 0;
+    let mut existing = 0;
+    let mut transient = 0;
+    for kind in ["tmp", "log"] {
+        if !legacy_link(root, id, temp_base, kind)? { continue; }
+        let old = Path::new("/tmp").join(id).join(kind);
+        if lstat(&old)?.is_some() {
+            copy_missing_tree(&old, &temp_base.join(id).join(kind), &mut copied, &mut existing, &mut transient)?;
+        }
+    }
+    if copied > 0 || existing > 0 || transient > 0 {
+        eprintln!("workspace_migration={id} copied={copied} already_present={existing} transient_skipped={transient} old_data_retained=true");
+    }
     Ok(())
 }
 
 fn ensure_link(root: &Path, id: &str, temp_base: &Path, kind: &str) -> Result<()> {
-    if expected_link_status(root, id, temp_base, kind)? { return Ok(()); }
+    if expected_link_status(root, id, temp_base, kind).unwrap_or(false) { return Ok(()); }
+    preflight_link(root, id, temp_base, kind)?;
     let link = root.join(format!(".{kind}"));
     let target = temp_base.join(id).join(kind);
+    if legacy_link(root, id, temp_base, kind)? {
+        // Atomic replacement of exactly the old bridge-managed link, not a
+        // general-purpose fixer of user-owned paths.
+        let staging = root.join(format!(".{kind}.g2c-migrate-{}", std::process::id()));
+        if lstat(&staging)?.is_some() { return Err(error("staging link already exists")); }
+        symlink(&target, &staging).map_err(|e| io_error("cannot stage workspace link", e))?;
+        let result = (|| {
+            if !legacy_link(root, id, temp_base, kind)? {
+                return Err(error("legacy workspace link changed during migration"));
+            }
+            fs::rename(&staging, &link).map_err(|e| io_error("cannot replace legacy link", e))
+        })();
+        if result.is_err() { let _ = fs::remove_file(&staging); }
+        return result;
+    }
     match symlink(&target, &link) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -552,13 +676,13 @@ fn preflight_ensure(root: &Path, rules: &Path, id: &str, temp_base: &Path, git_n
     check_tmp_base(temp_base)?;
     // Detect all common conflicts before changing any file.
     preflight_shared(root, rules)?;
-    expected_link_status(root, id, temp_base, "tmp")?;
-    expected_link_status(root, id, temp_base, "log")?;
+    preflight_link(root, id, temp_base, "tmp")?;
+    preflight_link(root, id, temp_base, "log")?;
     if lstat(&temp_base.join(id))?.is_some() {
-        check_directory(&temp_base.join(id), true)?;
-        for kind in ["tmp", "log"] {
+        storage_directory_state(&temp_base.join(id), temp_base)?;
+        for kind in storage_kinds(temp_base) {
             if lstat(&temp_base.join(id).join(kind))?.is_some() {
-                check_directory(&temp_base.join(id).join(kind), true)?;
+                storage_directory_state(&temp_base.join(id).join(kind), temp_base)?;
             }
         }
     }
@@ -575,6 +699,7 @@ fn do_ensure(root: &Path, rules: &Path, id: &str, temp_base: &Path, git_name: Op
     install_shared(root, rules, id)?;
     if standard { ensure_excludes(root)?; }
     ensure_history(root)?;
+    migrate_legacy_data(root, id, temp_base)?;
     ensure_link(root, id, temp_base, "tmp")?;
     ensure_link(root, id, temp_base, "log")?;
     if let (Some(name), Some(email)) = (git_name, git_email) { ensure_git_identity(root, name, email)?; }
@@ -582,7 +707,10 @@ fn do_ensure(root: &Path, rules: &Path, id: &str, temp_base: &Path, git_name: Op
 }
 
 /// Local-only, explicit first-time registration. No git clone, network or task execution.
-pub fn bootstrap(req: &BootstrapRequest) -> Result<()> { bootstrap_with_tmp(req, Path::new("/tmp")) }
+pub fn bootstrap(req: &BootstrapRequest) -> Result<()> {
+    let base = crate::registry::configured_temp_base(&req.config_path).map_err(|e| error(e.to_string()))?;
+    bootstrap_with_tmp(req, &base)
+}
 
 fn bootstrap_with_tmp(req: &BootstrapRequest, temp_base: &Path) -> Result<()> {
     let (dir, root) = validate_input(req)?;
@@ -594,15 +722,15 @@ fn bootstrap_with_tmp(req: &BootstrapRequest, temp_base: &Path) -> Result<()> {
     let global = config_text(req, &dir)?;
     let project = project_text(req)?;
     preflight_shared(&root, &dir.join(".ai"))?;
-    expected_link_status(&root, &req.id, temp_base, "tmp")?;
-    expected_link_status(&root, &req.id, temp_base, "log")?;
+    preflight_link(&root, &req.id, temp_base, "tmp")?;
+    preflight_link(&root, &req.id, temp_base, "log")?;
     missing_excludes(&root)?;
     preflight_git(&root, &req.git_name, &req.git_email)?;
     if lstat(&temp_base.join(&req.id))?.is_some() {
-        check_directory(&temp_base.join(&req.id), true)?;
-        for kind in ["tmp", "log"] {
+        storage_directory_state(&temp_base.join(&req.id), temp_base)?;
+        for kind in storage_kinds(temp_base) {
             if lstat(&temp_base.join(&req.id).join(kind))?.is_some() {
-                check_directory(&temp_base.join(&req.id).join(kind), true)?;
+                storage_directory_state(&temp_base.join(&req.id).join(kind), temp_base)?;
             }
         }
     }
@@ -627,7 +755,8 @@ pub struct AdoptReport {
 }
 
 pub fn adopt(req: &AdoptRequest, dry_run: bool) -> Result<AdoptReport> {
-    adopt_with_tmp(req, Path::new("/tmp"), dry_run)
+    let base = crate::registry::configured_temp_base(&req.config_path).map_err(|e| error(e.to_string()))?;
+    adopt_with_tmp(req, &base, dry_run)
 }
 
 fn adopt_with_tmp(req: &AdoptRequest, temp_base: &Path, dry_run: bool) -> Result<AdoptReport> {
@@ -679,7 +808,8 @@ fn adopt_with_tmp(req: &AdoptRequest, temp_base: &Path, dry_run: bool) -> Result
 }
 
 pub fn ensure(config_path: &Path, project_id: &str) -> Result<()> {
-    ensure_with_tmp(config_path, project_id, Path::new("/tmp"))
+    let base = crate::registry::configured_temp_base(config_path).map_err(|e| error(e.to_string()))?;
+    ensure_with_tmp(config_path, project_id, &base)
 }
 
 fn ensure_with_tmp(config_path: &Path, id: &str, temp_base: &Path) -> Result<()> {
@@ -695,7 +825,8 @@ fn ensure_with_tmp(config_path: &Path, id: &str, temp_base: &Path) -> Result<()>
 /// Explicit one-way metadata transaction. The operator prepares Git and its
 /// excludes first; this operation never initializes Git or edits project data.
 pub fn upgrade(config: &Path, id: &str, dry_run: bool) -> Result<()> {
-    upgrade_with_tmp(config, id, dry_run, Path::new("/tmp"))
+    let base = crate::registry::configured_temp_base(config).map_err(|e| error(e.to_string()))?;
+    upgrade_with_tmp(config, id, dry_run, &base)
 }
 
 fn upgrade_with_tmp(config: &Path, id: &str, dry_run: bool, temp: &Path) -> Result<()> {
@@ -793,7 +924,8 @@ pub fn sync_policy(config_path: &Path) -> Result<bool> {
 }
 
 pub fn health(config_path: &Path, project_id: &str) -> Result<Health> {
-    health_with_tmp(config_path, project_id, Path::new("/tmp"))
+    let base = crate::registry::configured_temp_base(config_path).map_err(|e| error(e.to_string()))?;
+    health_with_tmp(config_path, project_id, &base)
 }
 
 fn health_with_tmp(config_path: &Path, id: &str, temp_base: &Path) -> Result<Health> {
@@ -948,7 +1080,11 @@ mod tests {
         let repo = f.repo();
         assert_eq!(fs::read_link(repo.join(".tmp")).unwrap(), f.tmp.join("gpt2codex/tmp"));
         assert_eq!(fs::read_link(repo.join(".log")).unwrap(), f.tmp.join("gpt2codex/log"));
-        assert_eq!(fs::symlink_metadata(f.tmp.join("gpt2codex")).unwrap().mode() & 0o777, 0o700);
+        let storage = f.tmp.join("gpt2codex");
+        assert!(fs::symlink_metadata(&storage).unwrap().is_dir());
+        for kind in ["tmp", "log", "rel"] {
+            assert!(fs::symlink_metadata(storage.join(kind)).unwrap().is_dir());
+        }
         assert!(f.request.project_dir.join(".ai/CODEX_GLOBAL.md").is_file());
         assert!(repo.join(".ai/.project_codex.md").is_file());
         assert!(repo.join("AGENTS.md").is_file());
@@ -985,12 +1121,16 @@ mod tests {
     }
 
     #[test]
-    fn foreign_or_insecure_tmp_directory_is_rejected() {
+    fn operator_managed_storage_preserves_existing_permissions() {
         let f = Fixture::new();
-        fs::create_dir(f.tmp.join("gpt2codex")).unwrap();
-        fs::set_permissions(f.tmp.join("gpt2codex"), fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(bootstrap_with_tmp(&f.request, &f.tmp).is_err());
-        assert!(!f.request.config_path.exists());
+        let storage = f.tmp.join("gpt2codex");
+        fs::create_dir(&storage).unwrap();
+        fs::set_permissions(&storage, fs::Permissions::from_mode(0o755)).unwrap();
+        // The default /tmp remains strict; an operator-managed base is not chmod'ed.
+        assert!(storage_directory_state(&storage, Path::new("/tmp")).is_err());
+        bootstrap_with_tmp(&f.request, &f.tmp).unwrap();
+        assert_eq!(fs::symlink_metadata(&storage).unwrap().mode() & 0o777, 0o755);
+        assert!(f.request.config_path.exists());
     }
 
     #[test]

@@ -1,8 +1,18 @@
 # Platforms, service managers, and CI
 
-## Approved first alpha preparation (2026-10-28)
+## Current stable release target
 
-Current package version `0.1.0~alpha1`; workflow `.github/workflows/alpha.yml`.
+Package version `0.1.0`, tag `v0.1.0`; workflow `.github/workflows/release.yml`.
+Publication remains operator-controlled: `RELEASE_PUBLISH_ENABLED=true` and
+GitHub environment `stable-release` are required for the publish job.
+Tag pushes run mandatory Rust/Qt tests, build and Debian 13 install/remove
+verification before automatic publication. A normal branch push does not
+run the release workflow. Manual dispatch is diagnostic, never publishing.
+Existing Debian amd64 acceptance gates and experimental ARM builds remain.
+
+## Historical first-alpha preparation (2026-10-28)
+
+The original alpha package version was `0.1.0~alpha1`; its workflow was `.github/workflows/alpha.yml`.
 All builds use Debian 13: amd64 blocking, arm64/armhf experimental with
 fail-fast=false and continue-on-error. Quick checks run on each push/PR;
 full amd64 CI runs for relevant changes or uncertain detection. Release/manual

@@ -51,6 +51,25 @@ class AlphaTests(unittest.TestCase):
         self.assertFalse(any('credentials' in n or '__pycache__' in n for n in names))
         self.assertEqual(report['findings'],[])
 
+    def test_debhelper_build_outputs_are_not_release_sources(self):
+        root=self.fixture_source()
+        for name in ['debian/control', 'debian/rules']:
+            file=root/name;file.parent.mkdir(parents=True,exist_ok=True)
+            file.write_text('public packaging source\n')
+        generated=['debian/gpt2codex/usr/bin/gpt2codex',
+                   'debian/tmp/usr/bin/gpt2codex',
+                   'debian/files', 'debian/debhelper-build-stamp',
+                   'debian/gpt2codex.substvars', 'debian/gpt2codex.debhelper.log']
+        for name in generated:
+            file=root/name;file.parent.mkdir(parents=True,exist_ok=True)
+            file.write_bytes(b'\x7fELF\x00generated, not source')
+        with patch.object(alpha,'ROOT',root),patch.object(alpha,'HELPERS',[]):
+            report=alpha.audit()
+        names={entry['path'] for entry in report['files']}
+        self.assertTrue({'debian/control', 'debian/rules', 'src/lib.rs'} <= names)
+        self.assertTrue(all(name not in names for name in generated))
+        self.assertEqual(report['findings'],[])
+
     def test_audit_reports_secret_location_without_value(self):
         root=self.fixture_source()
         secret='ghp_'+'A'*40
@@ -235,6 +254,7 @@ class AlphaTests(unittest.TestCase):
             (work/f'lib/fixture/gpt2codex/backends/{name}.so').touch()
         (work/'os-release').write_text('VERSION_ID=13\nVERSION_CODENAME=excalibur\n')
         body=(ROOT/'gpt2codex-alpha-container.sh').read_text().split('elif [ "$mode" = smoke ]; then\n',1)[1].rsplit('\nelse\n',1)[0]
+        body='version='+alpha.VERSION+'\n'+body
         replacements={'/usr/bin/gpt2codex-gui':'fixture_gui','/etc/os-release':str(work/'os-release'),
                       '/usr/lib/':str(work/'lib')+'/','/work/':str(work/'work')+'/',
                       '/out/':str(work/'out')+'/','/input/':str(work/'input')+'/',
@@ -306,18 +326,22 @@ ldd() { trace "ldd $*"; if test "$G2C_FAIL" = elf; then printf 'library => not f
     def test_packaging_cmake_rejects_missing_backend(self):
         cp=subprocess.run(['cmake','-S',str(ROOT/'gui'),'-B',str(self.base/'cmake'),'-DG2C_BUILD_KONSOLE=OFF','-DG2C_REQUIRE_ALL_BACKENDS=ON','-DBUILD_TESTING=OFF'],capture_output=True,text=True)
         self.assertNotEqual(cp.returncode,0)
-        self.assertIn('Alpha package requires both',cp.stdout+cp.stderr)
+        self.assertIn('Release package requires both',cp.stdout+cp.stderr)
 
     def test_action_pins_and_default_publication_gate(self):
         lock=json.loads((ROOT/'packaging/ci-lock.json').read_text())
-        workflow=(ROOT/'.github/workflows/alpha.yml').read_text()
+        workflow=(ROOT/'.github/workflows/release.yml').read_text()
         for repo,value in lock['actions'].items():
             if repo=='actions/cache':
                 for operation in ['restore','save']:self.assertIn(repo+'/'+operation+'@'+value['commit'],workflow)
             else:self.assertIn(repo+'@'+value['commit'],workflow)
-        self.assertIn("vars.ALPHA_PUBLISH_ENABLED == 'true'",workflow)
-        self.assertIn('environment: alpha-release',workflow)
-        self.assertIn('--verify-tag --prerelease',workflow)
+        self.assertIn("vars.RELEASE_PUBLISH_ENABLED == 'true'",workflow)
+        self.assertIn('environment: stable-release',workflow)
+        self.assertIn('--verify-tag',workflow)
+        self.assertNotIn('--prerelease',workflow)
+        self.assertNotIn("branches: ['**']",workflow)
+        self.assertIn("tags: ['v*']",workflow)
+        self.assertIn('Validate stable tag and package versions',workflow)
         self.assertIn('continue-on-error: ${{ matrix.experimental }}',workflow)
         self.assertIn('fail-fast: false',workflow)
 
@@ -334,11 +358,11 @@ ldd() { trace "ldd $*"; if test "$G2C_FAIL" = elf; then printf 'library => not f
         self.assertIn('find /etc/apt/sources.list.d -type f -delete',script)
 
     def test_all_architectures_share_build_sources_and_smoke_keeps_distro_sources(self):
-        workflow=(ROOT/'.github/workflows/alpha.yml').read_text()
+        workflow=(ROOT/'.github/workflows/release.yml').read_text()
         self.assertIn('matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}',workflow)
         self.assertEqual(workflow.count('/src/gpt2codex-alpha-container.sh build'),1)
         for distro in ['debian','devuan']:self.assertIn(' smoke '+distro,workflow)
-        self.assertIn('test -f input/validated/gpt2codex_0.1.0~alpha1_amd64.deb',workflow)
+        self.assertIn('gpt2codex_${version}_amd64.deb',workflow)
         script=(ROOT/'gpt2codex-alpha-container.sh').read_text()
         smoke=script.split('elif [ "$mode" = smoke ]; then',1)[1]
         self.assertNotIn('/etc/apt',smoke)

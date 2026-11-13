@@ -4,6 +4,8 @@ set -eu
 test -f /.dockerenv || test -f /.gpt2codex-alpha-isolated || { echo 'Refusing non-isolated environment'; exit 2; }
 test "${G2C_ALPHA_CONTAINER:-}" = 1 || exit 2
 mode=${1:?build, quick or smoke}
+version=$(sed -n '1s/^gpt2codex (\([0-9][0-9.]*\)) .*/\1/p' /src/debian/changelog)
+test -n "$version"
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 LANG=C.UTF-8
 mkdir -p /work/tmp /work/home /work/state /work/config /work/screens /out
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
@@ -30,6 +32,8 @@ if [ "$mode" = build ] || [ "$mode" = quick ]; then
     python3 ./gpt2codex-ci.py fetch-cargo --cargo-home /work/cargo --cache /cargo-cache
     if [ "$mode" = quick ]; then
         cargo test --frozen --all-targets
+        cargo build --frozen --bin gpt2codex
+        python3 -B ./gpt2codex-project-types-test.py
         python3 ./gpt2codex-alpha-test.py --light
         python3 ./gpt2codex-ci-test.py
         python3 ./gpt2codex-ci.py actionlint --destination /work/actionlint
@@ -39,7 +43,7 @@ if [ "$mode" = build ] || [ "$mode" = quick ]; then
     fi
     dpkg-buildpackage -b -us -uc
     arch=$(dpkg --print-architecture)
-    deb=/work/gpt2codex_0.1.0~alpha1_${arch}.deb
+    deb=/work/gpt2codex_${version}_${arch}.deb
     python3 ./gpt2codex-alpha.py inspect --deb "$deb" --arch "$arch"
     python3 ./gpt2codex-alpha-test.py
     python3 ./gpt2codex-ci-test.py
@@ -62,7 +66,7 @@ elif [ "$mode" = smoke ]; then
     dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' systemd systemd-sysv > /out/init-before.tsv 2>/dev/null || :
     apt-get update
     apt-get install -y --no-install-recommends python3 ca-certificates binutils
-    deb=/input/gpt2codex_0.1.0~alpha1_amd64.deb
+    deb=/input/gpt2codex_${version}_amd64.deb
     test "$(dpkg --print-architecture)" = amd64
     case "$distro" in
         debian) test "$(. /etc/os-release; printf '%s' "$VERSION_ID")" = 13 ;;

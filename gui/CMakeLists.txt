@@ -87,7 +87,7 @@ if(G2C_BACKEND_COUNT EQUAL 0)
     message(FATAL_ERROR "No terminal backend can be built. Install libqtermwidget-dev + libutf8proc-dev and/or libkf6parts-dev + libkf6coreaddons-dev")
 endif()
 if(G2C_REQUIRE_ALL_BACKENDS AND (NOT G2C_HAVE_QTERM OR NOT G2C_HAVE_KONSOLE))
-    message(FATAL_ERROR "Alpha package requires both terminal modules; refusing an incomplete package")
+    message(FATAL_ERROR "Release package requires both terminal modules; refusing an incomplete package")
 endif()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/backends.json"
     "{\"konsole\": ${G2C_HAVE_KONSOLE}, \"qtermwidget\": ${G2C_HAVE_QTERM}}\n")

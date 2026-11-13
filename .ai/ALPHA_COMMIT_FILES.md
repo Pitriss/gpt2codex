@@ -1,5 +1,8 @@
 # First alpha commit candidates
 
+> Historical first-alpha inventory only. This list is not a staging list
+> for the 0.1.0 stable release; review the current checkout instead.
+
 Explicit candidate list from the current worktree, including untracked sources.
 This is a review inventory, **not** staging/commit/push authorization. Do not
 use `git add .`. The candidate audit uses this same allowlist; hash evidence
