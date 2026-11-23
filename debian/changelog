@@ -1,3 +1,11 @@
+gpt2codex (0.1.2) unstable; urgency=medium
+
+  * Build Debian arm64 packages on native GitHub Actions runners.
+  * Move experimental armhf packaging to an independent follow-up workflow.
+  * Update release CI tests for the separated QEMU action pin.
+
+ -- Pitriss <5106460+Pitriss@users.noreply.github.com>  Mon, 23 Nov 2026 15:43:49 +0100
+
 gpt2codex (0.1.1) unstable; urgency=medium
 
   * Bound GNU Screen queries and terminate hung subprocesses on timeout.
