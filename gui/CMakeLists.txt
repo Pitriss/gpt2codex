@@ -33,7 +33,8 @@ set(G2C_QUEUE_PYTHON_FILES
     gpt2codex_queue_project.py
     gpt2codex_queue_dispatch.py
     gpt2codex_queue_handoff.py
-    gpt2codex_queue_codex.py)
+    gpt2codex_queue_codex.py
+    gpt2codex_queue_recovery.py)
 set(G2C_QUEUE_PYTHON_INSTALL_FILES)
 foreach(script IN LISTS G2C_QUEUE_PYTHON_FILES)
     list(APPEND G2C_QUEUE_PYTHON_INSTALL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../${script}")

@@ -78,12 +78,26 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <signal.h>
+#include <unistd.h>
 
 #include "project_tab_presentation.h"
 
 namespace {
 
 using namespace g2ctheme;
+
+// Only bridge session-list queries get a private process group. Never target
+// the detached project screen servers (which belong to different groups).
+void killSessionListQuery(QProcess *process) {
+    if (!process) { return; }
+    const auto group = process->property("_g2cListGroup").toLongLong();
+    if (group > 0) {
+        (void)::kill(-static_cast<pid_t>(group), SIGKILL);
+    } else if (process->state() != QProcess::NotRunning) {
+        process->kill();
+    }
+}
 
 struct Options {
     QString bridgeCli;
@@ -1160,7 +1174,7 @@ bool activeQueueRow(const QJsonObject &row) {
     const auto status = row.value("queue_status").toString();
     return status == "pending" || status == "approved" || status == "approved-screen"
         || status == "approved-project-screen" || status == "blocked"
-        || status == "running";
+        || status == "running" || status == "unknown";
 }
 
 // GitHub Queue is an operator inbox. It never creates a Codex terminal,
@@ -1224,6 +1238,9 @@ public:
         action_->setObjectName(QStringLiteral("queueTaskAction"));
         action_->addItem(QStringLiteral("Schválit"), QStringLiteral("approve"));
         action_->addItem(QStringLiteral("Zamítnout"), QStringLiteral("reject"));
+        action_->addItem(QStringLiteral("Pokračovat"), QStringLiteral("resume"));
+        action_->addItem(QStringLiteral("Zahodit"), QStringLiteral("discard"));
+        action_->addItem(QStringLiteral("Více informací"), QStringLiteral("info"));
         actions->addWidget(action_, 1);
         confirm_ = new QPushButton(QStringLiteral("OK"), right);
         confirm_->setObjectName(QStringLiteral("queueTaskConfirm"));
@@ -1244,9 +1261,16 @@ public:
         });
         connect(approval_, &QCheckBox::toggled, this, [this] { updateAction(); });
         connect(action_, &QComboBox::currentIndexChanged, this, [this] {
-            approval_->setText(action_->currentData().toString() == QStringLiteral("approve")
+            const auto op = action_->currentData().toString();
+            approval_->setText(op == QStringLiteral("approve")
                 ? QStringLiteral("Zkontroloval jsem celé zadání a schvaluji jeho provedení.")
-                : QStringLiteral("Potvrzuji zamítnutí vybrané úlohy."));
+                : op == QStringLiteral("reject")
+                ? QStringLiteral("Potvrzuji zamítnutí vybrané úlohy.")
+                : op == QStringLiteral("resume")
+                ? QStringLiteral("Potvrzuji opakovaný pokus dosud nepřevzaté úlohy.")
+                : op == QStringLiteral("discard")
+                ? QStringLiteral("Potvrzuji zahození nepřevzaté úlohy. Pracovní soubory zůstanou.")
+                : QStringLiteral("Více informací pouze zobrazí lokální stav."));
             approval_->setChecked(false);
             updateAction();
         });
@@ -1314,15 +1338,17 @@ public:
                         for (auto &row : rows) {
                             if (row.value("number").toInt() != number) { continue; }
                             row.insert("title", title);
-                            row.insert("queue_status", status);
+                            row.insert("queue_status", job.value("display_status").toString(status));
                             row.insert("mode", job.value("mode"));
+                            row.insert("block", job.value("block"));
                             found = true;
                         }
                         if (!found) {
                             rows.append(QJsonObject{{"key", QStringLiteral("issue:%1").arg(number)},
                                 {"number", number}, {"project", project}, {"title", title},
-                                {"mode", job.value("mode")}, {"queue_status", status},
-                                {"attachable", false}});
+                                {"mode", job.value("mode")},
+                                {"queue_status", job.value("display_status").toString(status)},
+                                {"block", job.value("block")}, {"attachable", false}});
                         }
                     }
                 }
@@ -1425,8 +1451,14 @@ private:
         task_->clear();
         header_->setText(row.isEmpty() ? QStringLiteral("Vyber úlohu")
             : QStringLiteral("#%1 · %2").arg(row.value("number").toInt()).arg(row.value("title").toString()));
-        metadata_->setText(row.isEmpty() ? QString() : QStringLiteral("Projekt: %1 · Stav: %2 · Režim: %3")
-            .arg(row.value("project").toString(), row.value("queue_status").toString(), row.value("mode").toString()));
+        QString localStatus = row.isEmpty() ? QString() : QStringLiteral("Projekt: %1 · Stav: %2 · Režim: %3")
+            .arg(row.value("project").toString(), row.value("queue_status").toString(), row.value("mode").toString());
+        const auto block = row.value("block").toObject();
+        if (!block.isEmpty()) {
+            localStatus += QStringLiteral("\nDůvod: %1 (%2)")
+                .arg(block.value("message").toString(), block.value("code").toString());
+        }
+        metadata_->setText(localStatus);
         updateAction();
         if (row.isEmpty() || row.value("number").toInt() <= 0 || !QFileInfo(queueCli()).isFile()) { return; }
         const int number = row.value("number").toInt();
@@ -1446,32 +1478,73 @@ private:
                     verified_ = obj;
                     header_->setText(QStringLiteral("#%1 · %2").arg(number).arg(obj.value("title").toString()));
                     task_->setPlainText(obj.value("task").toString());
-                    metadata_->setText(QStringLiteral("Projekt: %1 · Stav: %2 · Režim: %3\nSHA-256: %4")
+                    QString info = QStringLiteral("Projekt: %1 · Stav: %2 · Režim: %3\nSHA-256: %4")
                         .arg(obj.value("project").toString(), obj.value("status").toString(),
-                             obj.value("mode").toString(), obj.value("digest").toString()));
+                             obj.value("mode").toString(), obj.value("digest").toString());
+                    const auto block = obj.value("block").toObject();
+                    if (!block.isEmpty()) {
+                        info += QStringLiteral("\nČeká na prostředí: %1 (%2)")
+                            .arg(block.value("message").toString(), block.value("code").toString());
+                    } else if (obj.value("review_state").toString() == QStringLiteral("claimed_unverified")) {
+                        info += QStringLiteral("\nÚloha už byla převzata. Stav vykonávání vyžaduje ruční ověření; automatické Resume není dostupné.");
+                    }
+                    metadata_->setText(info);
                 }
                 approval_->setChecked(false);
                 updateAction();
             });
     }
     void updateAction() {
-        const bool pending = verified_.value("status").toString() == QStringLiteral("pending")
-            && verified_.value("remote_state").toString() == QStringLiteral("open")
-            && selected().value("number").toInt() == verified_.value("number").toInt()
-            && !acting_;
-        approval_->setEnabled(pending);
-        action_->setEnabled(pending);
-        confirm_->setEnabled(pending && approval_->isChecked());
+        const bool visible = selected().value("number").toInt() > 0 && !acting_;
+        const bool same = visible && verified_.value("number").toInt() > 0
+            && selected().value("number").toInt() == verified_.value("number").toInt();
+        const auto status = verified_.value("status").toString();
+        const auto op = action_->currentData().toString();
+        const bool open = verified_.value("remote_state").toString() == QStringLiteral("open");
+        const bool pending = same && open && status == QStringLiteral("pending");
+        const bool unclaimed = same && open && status == QStringLiteral("approved-project-screen");
+        const bool allowed = op == QStringLiteral("approve") || op == QStringLiteral("reject")
+            ? pending : op == QStringLiteral("resume")
+            ? unclaimed && verified_.value("block").isObject()
+            : op == QStringLiteral("discard") ? unclaimed
+            : op == QStringLiteral("info") ? visible : false;
+        action_->setEnabled(visible);
+        approval_->setEnabled(allowed && op != QStringLiteral("info"));
+        confirm_->setEnabled(allowed && (op == QStringLiteral("info") || approval_->isChecked()));
     }
     void performAction() {
-        const auto job = verified_;
-        if (!approval_->isChecked() || acting_ || job.value("status").toString() != QStringLiteral("pending")
-            || selected().value("number").toInt() != job.value("number").toInt()) { return; }
+        const auto local = selected();
+        const auto job = verified_.isEmpty() ? local : verified_;
+        if (acting_ || job.value("number").toInt() <= 0
+            || local.value("number").toInt() != job.value("number").toInt()) { return; }
         const int number = job.value("number").toInt();
         const auto action = action_->currentData().toString();
-        if (action == QStringLiteral("reject") && QMessageBox::question(this,
-                QStringLiteral("Zamítnout úlohu"),
-                QStringLiteral("Opravdu zamítnout úlohu #%1?").arg(number)) != QMessageBox::Yes) { return; }
+        if (action == QStringLiteral("info")) {
+            const auto block = job.value("block").toObject();
+            QString detail = QStringLiteral("Stav: %1\nProjekt: %2\nBackend: %3\n")
+                .arg(job.value("status").toString(job.value("queue_status").toString()),
+                     job.value("project").toString(), job.value("approved_backend").toString("—"));
+            if (!block.isEmpty()) {
+                detail += QStringLiteral("Důvod: %1\nKód: %2\n")
+                    .arg(block.value("message").toString(), block.value("code").toString());
+            }
+            if (job.value("review_state").toString() == QStringLiteral("claimed_unverified")) {
+                detail += QStringLiteral("Úloha mohla již vykonávat změny. Obnova původního Codex turnu není ověřená.\n");
+            }
+            detail += QStringLiteral("Vytvořený thread: %1\nQueue slot: %2")
+                .arg(job.value("thread_id").toString("—"), job.value("screen_slot").toString("—"));
+            QMessageBox::information(this, QStringLiteral("Queue úloha #%1").arg(number), detail);
+            return;
+        }
+        if (!approval_->isChecked() || !confirm_->isEnabled()) { return; }
+        const auto status = job.value("status").toString();
+        if ((action == QStringLiteral("approve") || action == QStringLiteral("reject"))
+                && status != QStringLiteral("pending")) { return; }
+        if ((action == QStringLiteral("resume") || action == QStringLiteral("discard"))
+                && status != QStringLiteral("approved-project-screen")) { return; }
+        if ((action == QStringLiteral("reject") || action == QStringLiteral("discard"))
+                && QMessageBox::question(this, QStringLiteral("Potvrzení úlohy"),
+                    QStringLiteral("Opravdu zahodit nebo zamítnout úlohu #%1? Soubory projektu zůstanou beze změny.").arg(number)) != QMessageBox::Yes) { return; }
         QStringList args;
         if (action == QStringLiteral("approve")) {
             args = {QStringLiteral("gui-approve"), QString::number(number),
@@ -1479,6 +1552,11 @@ private:
                 QStringLiteral("--confirmation"), QStringLiteral("SCHVALUJI %1").arg(number)};
         } else if (action == QStringLiteral("reject")) {
             args = {QStringLiteral("reject"), QString::number(number)};
+        } else if (action == QStringLiteral("resume") || action == QStringLiteral("discard")) {
+            args = {QStringLiteral("operator-action"), QString::number(number),
+                QStringLiteral("--action"), action,
+                QStringLiteral("--digest"), job.value("digest").toString(),
+                QStringLiteral("--confirmation"), action.toUpper() + QStringLiteral(" %1").arg(number)};
         } else { return; }
         acting_ = true;
         updateAction();
@@ -1765,6 +1843,11 @@ public:
     void showQueueTasks() { tabs_->setCurrentWidget(queuePage_); }
 
     ~MainWindow() override {
+        // A GUI close must not orphan a hanging `screen -ls` grandchild.
+        if (query_ && query_->state() != QProcess::NotRunning) {
+            killSessionListQuery(query_);
+            query_->waitForFinished(1000);
+        }
         if (queueActivityQuery_) {
             auto *proc = queueActivityQuery_;
             queueActivityQuery_ = nullptr;
@@ -2060,9 +2143,21 @@ private:
         allowlistProblem_->setVisible(!allowOk);
         auto *proc = new QProcess(this);
         query_ = proc;
+        // Keep CLI and its `screen -ls` child in a dedicated disposable group.
+        proc->setChildProcessModifier([] {
+            if (::setpgid(0, 0) != 0) { ::_exit(127); }
+        });
+        connect(proc, &QProcess::started, proc, [proc] {
+            const auto pid = static_cast<pid_t>(proc->processId());
+            if (pid > 0 && ::getpgid(pid) == pid) {
+                proc->setProperty("_g2cListGroup", static_cast<qint64>(pid));
+            }
+        });
         proc->setProcessChannelMode(QProcess::SeparateChannels);
         connect(proc, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
             [this, proc, allowed, allowOk](int code, QProcess::ExitStatus exitStatus) {
+                // Clean up descendants even when the CLI exits before its child.
+                killSessionListQuery(proc);
                 if (query_ != proc) { return; }
                 query_ = nullptr;
                 const QByteArray data = proc->readAllStandardOutput();
@@ -2128,9 +2223,9 @@ private:
             proc->deleteLater();
         });
         proc->start(options_.bridgeCli, listArguments(options_));
-        QTimer::singleShot(3000, this, [this, tracked = QPointer<QProcess>(proc)] {
+        QTimer::singleShot(8000, this, [this, tracked = QPointer<QProcess>(proc)] {
             if (tracked && query_ == tracked) {
-                tracked->kill();
+                killSessionListQuery(tracked);
                 statusBar()->showMessage(QStringLiteral("Čtení stavu bridge překročilo časový limit."), 9000);
             }
         });

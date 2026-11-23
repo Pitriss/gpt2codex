@@ -34,6 +34,7 @@ if [ "$mode" = build ] || [ "$mode" = quick ]; then
         cargo test --frozen --all-targets
         cargo build --frozen --bin gpt2codex
         python3 -B ./gpt2codex-project-types-test.py
+        python3 -B ./gpt2codex-queue-recovery-test.py
         python3 ./gpt2codex-alpha-test.py --light
         python3 ./gpt2codex-ci-test.py
         python3 ./gpt2codex-ci.py actionlint --destination /work/actionlint
@@ -46,6 +47,7 @@ if [ "$mode" = build ] || [ "$mode" = quick ]; then
     deb=/work/gpt2codex_${version}_${arch}.deb
     python3 ./gpt2codex-alpha.py inspect --deb "$deb" --arch "$arch"
     python3 ./gpt2codex-alpha-test.py
+    python3 -B ./gpt2codex-queue-recovery-test.py
     python3 ./gpt2codex-ci-test.py
     sh -n ./gpt2codex-alpha-container.sh
     lintian --fail-on error "$deb"

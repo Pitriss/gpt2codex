@@ -26,7 +26,8 @@ HELPERS = ['gpt2codex-alpha.py', 'gpt2codex-alpha-infra.py', 'gpt2codex-alpha-co
            'gpt2codex-alpha-rootfs-test.py',
            'gpt2codex-alpha-test.py', 'gpt2codex-project-icons-test.py', 'gpt2codex-multiplexer-test.py',
            'gpt2codex-terminal-diagnostics.py', 'gpt2codex-p0ic-qt6-test-v2.sh',
-            'gpt2codex-project-types-test.py', 'gpt2codex-github-queue.py', 'gpt2codex_queue_codex.py', 'gpt2codex_queue_dispatch.py', 'gpt2codex_queue_handoff.py', 'gpt2codex_queue_project.py', 'gpt2codex_queue_screen.py'
+            'gpt2codex-project-types-test.py', 'gpt2codex-github-queue.py', 'gpt2codex_queue_codex.py', 'gpt2codex_queue_dispatch.py', 'gpt2codex_queue_handoff.py', 'gpt2codex_queue_project.py', 'gpt2codex_queue_screen.py',
+           'gpt2codex_queue_recovery.py', 'gpt2codex-queue-recovery-test.py'
 ]
 
 

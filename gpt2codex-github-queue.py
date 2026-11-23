@@ -300,7 +300,8 @@ def parse_issue(issue, cfg):
 
 EVENT_NAMES = frozenset(("poll", "approved", "claimed", "screen_started",
                          "turn_started", "turn_completed", "handoff_published",
-                         "failed", "worker_started", "poll_failed", "blocked", "unknown", "launch_started"))
+                         "failed", "worker_started", "poll_failed", "blocked", "unknown",
+                         "launch_started", "anchor_recovered"))
 EVENT_MAX_BYTES = 1024 * 1024
 
 
@@ -467,8 +468,16 @@ def gui_list(store):
     """Complete untruncated local issue metadata; no token/network needed."""
     with store.lock():
         jobs = store.load()['jobs'].values()
-        data = [{k: job.get(k) for k in ('number', 'status', 'project', 'mode', 'digest', 'title')}
-                for job in jobs]
+        data = []
+        for job in jobs:
+            row = {k: job.get(k) for k in ('number', 'status', 'project', 'mode', 'digest', 'title')}
+            block = job.get('block')
+            if job.get('status') == 'approved-project-screen' and isinstance(block, dict):
+                row['display_status'] = 'blocked'
+                row['block'] = {k: block.get(k) for k in ('code', 'message', 'at')}
+            if job.get('status') in ('running', 'unknown'):
+                row['review_state'] = 'claimed_unverified'
+            data.append(row)
     print(json.dumps(sorted(data, key=lambda j: j['number']), ensure_ascii=False))
 
 
@@ -517,10 +526,12 @@ def show_jobs(store, active_only=False):
     with store.lock():
         values = list(store.load()["jobs"].values())
     if active_only:
-        terminal = {"done", "failed", "rejected"}
+        terminal = {"done", "failed", "rejected", "discarded"}
         values = [job for job in values if job["status"] not in terminal]
     for job in sorted(values, key=lambda a: a["number"]):
-        print(f'#{job["number"]} {job["status"]:9} {job["project"]:14} '
+        status = ('blocked' if job['status'] == 'approved-project-screen'
+                  and isinstance(job.get('block'), dict) else job['status'])
+        print(f'#{job["number"]} {status:9} {job["project"]:14} '
               f'{job["mode"]:15} {job["digest"][:12]} {job["title"][:70]}')
     if not values:
         print("No active/pending queue requests" if active_only else "No accepted queue requests")
@@ -601,9 +612,15 @@ def gui_detail(api, store, cfg, number):
         raise QueueError("Issue is not in local queue")
     if not item or job['id'] != item['id'] or job['digest'] != item['digest']:
         raise QueueError("Remote Issue changed or invalid; refresh required")
+    block = job.get('block') if isinstance(job.get('block'), dict) else None
     print(json.dumps({**item, 'status': job['status'],
                       'remote_state': issue.get('state'),
-                      'approved_backend': job.get('backend')}, ensure_ascii=False))
+                      'approved_backend': job.get('backend'),
+                      'block': {k: block.get(k) for k in ('code', 'message', 'at')} if block else None,
+                      'started_at': job.get('started_at'), 'finished_at': job.get('finished_at'),
+                      'thread_id': job.get('thread_id'), 'screen_slot': job.get('screen_slot'),
+                      'review_state': 'claimed_unverified' if job['status'] in ('running', 'unknown') else None},
+                     ensure_ascii=False))
 
 
 def gui_approve(api, store, cfg, number, digest, confirmation):
@@ -633,6 +650,69 @@ def gui_approve(api, store, cfg, number, digest, confirmation):
         job['status'] = 'approved-project-screen'
         store.save(state)
     print(f'APPROVED #{number}; project-screen; worker will claim automatically')
+
+
+def operator_action(store, number, action, digest, confirmation):
+    """Offline operator decision, never a Codex replay or unsafe claim reset.
+
+    Resume is ONLY a request to retry an approved, never-claimed Queue job;
+    it does not resume an uncertain Codex thread. Unknown/running cannot be
+    discarded automatically, because a live process may still own the slot.
+    """
+    if action not in ('resume', 'discard') or confirmation != f'{action.upper()} {number}':
+        raise QueueError('Invalid operator confirmation')
+    if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+        raise QueueError('Invalid operator digest')
+    with store.lock():
+        state = store.load()
+        job = state['jobs'].get(str(number))
+        if (not job or job.get('status') != 'approved-project-screen'
+                or job.get('backend', 'project-screen') != 'project-screen'
+                or job.get('digest') != digest):
+            raise QueueError('Only an unclaimed approved project-screen job may be changed')
+        if action == 'resume':
+            if not isinstance(job.get('block'), dict):
+                raise QueueError('Job is not marked blocked; Queue already retries it')
+            job.pop('block', None)
+            job['operator_retry_at'] = int(time.time())
+        else:
+            job['status'] = 'discarded'
+            job['discarded_at'] = int(time.time())
+        store.save(state)
+    print(f'OPERATOR_ACTION={action} ISSUE={number} CLAIMED=no')
+
+
+def _block_descriptor(message):
+    # Fixed allowlisted categories only. Never persist raw exceptions, paths,
+    # process environment, issue bodies or GitHub error responses.
+    value = str(message)
+    if 'project_busy' in value or 'Earlier approved' in value:
+        return 'project_busy', 'Projekt je obsazen nebo čeká na starší úlohu.'
+    if 'Unresolved' in value or 'unresolved' in value:
+        return 'unresolved_claim', 'Existuje dříve převzatá úloha s neověřeným výsledkem.'
+    if 'Rust screen' in value and 'refused' in value or 'recovery' in value.lower():
+        return 'recovery_refused', 'Automatická obnova screen nebyla prokazatelně bezpečná.'
+    if value.startswith('project-screen preclaim refused:'):
+        return 'preclaim_refused', 'Ověření projektu nebo binárek selhalo před převzetím úlohy.'
+    if value.startswith('project-screen waiting:'):
+        return 'environment_missing', 'Projektový screen nebo anchor není připraven.'
+    return 'preflight_refused', 'Provedení bylo odmítnuto před převzetím úlohy.'
+
+
+def _remember_block(store, number, backend, message):
+    if backend != 'project-screen':
+        return
+    code, description = _block_descriptor(message)
+    with store.lock():
+        state = store.load()
+        job = state['jobs'].get(str(number))
+        if not job or job.get('status') != 'approved-project-screen':
+            return
+        old = job.get('block')
+        if isinstance(old, dict) and old.get('code') == code:
+            return
+        job['block'] = {'code': code, 'message': description, 'at': int(time.time())}
+        store.save(state)
 
 
 def reject(store, number):
@@ -765,7 +845,11 @@ def _execute_claimed(api, store, cfg, number, backend, leases):
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             raise QueueError(f"project-screen preclaim refused: {exc}") from None
         try:
-            project_backend.anchor_ready(store, item["project"], project_dir)
+            import gpt2codex_queue_recovery as recovery
+            _view, _anchor, restored = recovery.ensure_anchor(
+                store, cfg, item, project_dir, item['_project_validation'])
+            if restored:
+                worker_event(store, 'anchor_recovered', number, backend, item['mode'])
             screen_backend.require_chatgpt(str(codex), screen_backend.clean_env())
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             raise QueueError(f"project-screen waiting: {exc}") from None
@@ -802,6 +886,7 @@ def _execute_claimed(api, store, cfg, number, backend, leases):
                 raise QueueError(f"project-screen preclaim changed: {exc}") from None
             job["project_validation"] = item["_project_validation"]
         job["status"] = "running"
+        job.pop('block', None)
         job["backend"] = backend
         job["worker_host"] = cfg["worker_hostname"]
         job["started_at"] = int(time.time())
@@ -957,6 +1042,7 @@ def _run_one_logged(api, store, cfg, number, backend):
     try:
         return run_one(api, store, cfg, number, backend)
     except QueueError as exc:
+        _remember_block(store, number, backend, str(exc))
         worker_event(store, "blocked", number, backend)
         print(f'BLOCKED #{number}: {exc}', file=sys.stderr, flush=True)
     except Exception as exc:
@@ -1244,6 +1330,11 @@ def main(argv=None):
     ga.add_argument('number', type=int)
     ga.add_argument('--digest', required=True)
     ga.add_argument('--confirmation', required=True)
+    operation = sub.add_parser('operator-action', help='Offline review of never-claimed blocked tasks')
+    operation.add_argument('number', type=int)
+    operation.add_argument('--action', dest='decision', choices=('resume', 'discard'), required=True)
+    operation.add_argument('--digest', required=True)
+    operation.add_argument('--confirmation', required=True)
     sub.add_parser("run-approved")
     screen = sub.add_parser("run-screen", help="One approved Issue in a NEW isolated screen slot")
     screen.add_argument("number", type=int)
@@ -1297,6 +1388,9 @@ def main(argv=None):
         return 0
     if args.action == "reject":
         reject(Store(repo_root), args.number)
+        return 0
+    if args.action == 'operator-action':
+        operator_action(Store(repo_root), args.number, args.decision, args.digest, args.confirmation)
         return 0
     if args.action == "handoff-status":
         handoff_status(Store(repo_root), args.number)

@@ -12,11 +12,13 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_SCREEN_OUTPUT: usize = 64 * 1024;
 const MAX_RECORD_SIZE: u64 = 16 * 1024;
@@ -115,25 +117,85 @@ pub fn probe() -> Result<()> {
 
 fn bounded_screen_output(args: &[&str]) -> Result<String> {
     // No user-controlled raw command or -X interface is allowed here.
-    let mut child = Command::new("screen")
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+    bounded_screen_command_output("screen", args, Duration::from_millis(2500))
+}
+
+fn bounded_screen_command_output(program: &str, args: &[&str], timeout: Duration) -> Result<String> {
+    let mut command = Command::new(program);
+    command.args(args).env("LC_ALL", "C")
+        .stdout(Stdio::piped()).stderr(Stdio::null());
+    // Best effort on direct CLI termination. GUI also kills the isolated
+    // session-list process group: setgid binaries may clear PDEATHSIG at exec.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let owner = std::process::id() as libc::pid_t;
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != owner { libc::_exit(127); }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()
         .map_err(|_| err("GNU screen could not be started"))?;
-    let mut data = Vec::new();
-    let read_result = child.stdout.take().ok_or_else(|| err("GNU screen stdout unavailable"))?
-        .take((MAX_SCREEN_OUTPUT + 1) as u64).read_to_end(&mut data);
-    if data.len() > MAX_SCREEN_OUTPUT || read_result.is_err() {
+    let result = (|| -> Result<String> {
+        let mut stdout = child.stdout.take()
+            .ok_or_else(|| err("GNU screen stdout unavailable"))?;
+        let mut data = Vec::new();
+        let mut eof = false;
+        let mut exited = false;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !exited {
+                exited = child.try_wait()
+                    .map_err(|_| err("GNU screen output unavailable"))?.is_some();
+            }
+            if exited && eof {
+                // `screen -ls` returns nonzero when there are no sessions.
+                return String::from_utf8(data)
+                    .map_err(|_| err("GNU screen output is not UTF-8"));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() { return Err(err("GNU screen query timed out")); }
+            if eof {
+                thread::sleep(left.min(Duration::from_millis(20)));
+                continue;
+            }
+            let mut pollfd = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+            let wait_ms = left.min(Duration::from_millis(50)).as_millis().max(1) as libc::c_int;
+            let ready = unsafe { libc::poll(&mut pollfd, 1, wait_ms) };
+            if ready == 0 { continue; }
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err("GNU screen pipe poll failed"));
+            }
+            let mut chunk = [0u8; 8192];
+            match stdout.read(&mut chunk) {
+                Ok(0) => eof = true,
+                Ok(count) => {
+                    if data.len() + count > MAX_SCREEN_OUTPUT {
+                        return Err(err("invalid or oversized GNU screen response"));
+                    }
+                    data.extend_from_slice(&chunk[..count]);
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(err("GNU screen pipe read failed")),
+            }
+        }
+    })();
+    // Always reap the child on error, including timeout and oversized output.
+    if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(err("invalid or oversized GNU screen response"));
     }
-    child.wait().map_err(|_| err("GNU screen output unavailable"))?;
-    // `screen -ls` returns nonzero when there are no sessions.  Do not
-    // interpret that as a protocol error.
-    String::from_utf8(data).map_err(|_| err("GNU screen output is not UTF-8"))
+    result
 }
 
 fn parse_sessions(output: &str) -> Vec<LiveSession> {
@@ -649,6 +711,24 @@ fn list_impl(config: &Path, tolerate_discovery_failure: bool) -> Result<Vec<Stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_command_timeout_and_normal_output() {
+        let started = Instant::now();
+        let failure = bounded_screen_command_output("/bin/sleep", &["30"],
+            Duration::from_millis(150)).unwrap_err();
+        assert!(failure.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(bounded_screen_command_output("/bin/echo", &["ready"],
+            Duration::from_secs(2)).unwrap(), "ready\n");
+    }
+
+    #[test]
+    fn screen_command_rejects_oversized_output() {
+        let failure = bounded_screen_command_output("/usr/bin/head",
+            &["-c", "70000", "/dev/zero"], Duration::from_secs(2)).unwrap_err();
+        assert!(failure.to_string().contains("oversized"));
+    }
 
     #[test]
     fn screen_window_inventory_is_strict_and_read_only_metadata() {
