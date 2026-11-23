@@ -95,7 +95,7 @@ jobs:
     name: Debian 13 / ${{ matrix.arch }}${{ matrix.experimental && ' (experimental)' || '' }}
     needs: plan
     if: needs.plan.outputs.full == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     continue-on-error: ${{ matrix.experimental }}
     strategy:
@@ -123,12 +123,6 @@ jobs:
         with:
           path: .tmp/cargo-${{ matrix.arch }}/*/*.crate
           key: g2c-trusted-crates-v1-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'packaging/ci-lock.json') }}
-      - name: Register pinned ARM emulators
-        if: matrix.experimental
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392  # v3.6.0
-        with:
-          image: ${{ needs.plan.outputs.binfmt }}
-          platforms: arm,arm64
       - name: Build and test complete package inside Debian 13
         env:
           IMAGE: ${{ needs.plan.outputs.debian }}
@@ -297,7 +291,7 @@ jobs:
           python3 - <<'PY'
           import os
           e=os.environ
-          lines=['Quick checks: '+e['QUICK'],'Full Debian CI: '+(e['DEBIAN'] if e['FULL']=='true' else 'NOT RUN'),'ARM64/ARMHF: '+('see individual build reports (experimental)' if e['ARM']=='true' else 'NOT RUN'),'Devuan (optional): '+(e['DEVUAN'] or 'NOT RUN'),'Release validation: '+(e['VALIDATION'] if e['CANDIDATE']=='true' else 'NOT RUN; this push is not a validated release')]
+          lines=['Quick checks: '+e['QUICK'],'Full Debian CI: '+(e['DEBIAN'] if e['FULL']=='true' else 'NOT RUN'),'ARM64: '+('see native build report (experimental)' if e['ARM']=='true' else 'NOT RUN'),'ARMHF: separate non-blocking follow-up after validated ARM64','Devuan (optional): '+(e['DEVUAN'] or 'NOT RUN'),'Release validation: '+(e['VALIDATION'] if e['CANDIDATE']=='true' else 'NOT RUN; this push is not a validated release')]
           with open(e['GITHUB_STEP_SUMMARY'],'a') as out:
               out.write('\n\n'.join(lines)+'\n')
           valid=e['PLAN']=='success' and e['QUICK']=='success'

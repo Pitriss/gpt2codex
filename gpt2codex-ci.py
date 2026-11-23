@@ -45,10 +45,9 @@ def plan(event_name, ref, event, paths):
     arm=release or manual
     inputs=event.get('inputs') or {}
     devuan=manual and isinstance(inputs,dict) and inputs.get('run_devuan',False) in (True,'true')
-    matrix=[{'arch':'amd64','platform':'linux/amd64','experimental':False}]
+    matrix=[{'arch':'amd64','platform':'linux/amd64','experimental':False,'runner':'ubuntu-24.04'}]
     if arm:
-        matrix += [{'arch':'arm64','platform':'linux/arm64','experimental':True},
-                   {'arch':'armhf','platform':'linux/arm/v7','experimental':True}]
+        matrix.append({'arch':'arm64','platform':'linux/arm64','experimental':True,'runner':'ubuntu-24.04-arm'})
     return {'full':full,'arm':arm,'devuan':devuan,'candidate':release or manual,
             'detection':'unknown: full build required' if paths is None else 'complete',
             'changed_files':len(paths) if paths is not None else None,'matrix':{'include':matrix}}
@@ -178,7 +177,7 @@ def static_checks(actionlint):
             shell='bash' if 'bash' in p.read_text().splitlines()[0] else 'sh'
             subprocess.run([shell,'-n',str(p)],check=True)
     subprocess.run(['yamllint','-d','{extends: relaxed, rules: {line-length: disable}}',str(ROOT/'.github/workflows')],check=True)
-    subprocess.run([str(actionlint),str(ROOT/'.github/workflows/release.yml')],check=True)
+    subprocess.run([str(actionlint),*map(str,sorted((ROOT/'.github/workflows').glob('*.yml')))],check=True)
 
 
 def install_actionlint(destination):

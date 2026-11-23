@@ -54,7 +54,7 @@ class CITests(unittest.TestCase):
             result=ci.plan('workflow_dispatch','refs/heads/main',{'inputs':{'run_devuan':value}},['README.md'])
             self.assertTrue(result['full']);self.assertTrue(result['arm']);self.assertTrue(result['candidate'])
             self.assertEqual(result['devuan'],value in [True,'true'])
-            self.assertEqual([r['arch'] for r in result['matrix']['include']],['amd64','arm64','armhf'])
+            self.assertEqual([r['arch'] for r in result['matrix']['include']],['amd64','arm64'])
 
     def test_release_tag_always_requests_complete_candidate_even_for_docs(self):
         result=ci.plan('push','refs/tags/v0.1.0',{},['README.md'])
@@ -62,6 +62,30 @@ class CITests(unittest.TestCase):
         self.assertFalse(result['devuan'])
         self.assertFalse(result['matrix']['include'][0]['experimental'])
         self.assertTrue(all(row['experimental'] for row in result['matrix']['include'][1:]))
+        self.assertEqual(result['matrix']['include'][0]['runner'],'ubuntu-24.04')
+        self.assertEqual(result['matrix']['include'][1]['runner'],'ubuntu-24.04-arm')
+
+    def test_armhf_is_off_axis_and_not_in_main_build_matrix(self):
+        for event,ref,inputs in [
+            ('push','refs/tags/v0.1.1',{}),
+            ('workflow_dispatch','refs/heads/main',{'run_arm':'true'}),
+            ('push','refs/heads/main',{}),
+        ]:
+            with self.subTest(event=event,ref=ref):
+                result=ci.plan(event,ref,{'inputs':inputs},['src/main.rs'])
+                rows=result['matrix']['include']
+                self.assertNotIn('armhf',[row['arch'] for row in rows])
+                self.assertEqual(rows[0]['runner'],'ubuntu-24.04')
+                if result['arm']:
+                    self.assertEqual(rows[1]['runner'],'ubuntu-24.04-arm')
+        followup=(ROOT/'.github/workflows/release-armhf.yml').read_text()
+        self.assertIn('workflow_run:',followup)
+        self.assertIn('run-id: ${{ github.event.workflow_run.id }}',followup)
+        self.assertIn("report['architecture']=='arm64' and report['status']=='PASS'",followup)
+        self.assertIn("needs.verify-arm64.outputs.ready == 'true'",followup)
+        self.assertIn("vars.RELEASE_PUBLISH_ENABLED == 'true'",followup)
+        self.assertIn('environment: stable-release',followup)
+        self.assertNotIn('--clobber',followup)
 
     def test_push_api_completeness_errors_and_renames(self):
         event={'before':'a'*40,'after':'b'*40}
@@ -156,7 +180,7 @@ class CITests(unittest.TestCase):
         self.assertEqual(cp.returncode,0,cp.stderr)
         values=dict(line.split('=',1) for line in output.read_text().splitlines())
         self.assertEqual(values['full'],'true');self.assertEqual(values['devuan'],'false')
-        self.assertEqual(len(json.loads(values['matrix'])['include']),3)
+        self.assertEqual(len(json.loads(values['matrix'])['include']),2)
 
     def test_actionlint_checksum_failure_is_not_bypassed(self):
         with patch.object(ci.urllib.request,'urlopen',return_value=io.BytesIO(b'changed fixture')):

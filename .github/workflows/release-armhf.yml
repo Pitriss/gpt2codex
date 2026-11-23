@@ -1,0 +1,224 @@
+name: Experimental armhf follow-up
+
+'on':
+  workflow_run:
+    workflows: ['Debian packages']
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: armhf-follow-up-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  verify-arm64:
+    name: Verify source and validated arm64 artifact
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    outputs:
+      ready: ${{ steps.gate.outputs.ready }}
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+      event: ${{ steps.source.outputs.event }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact repository, ref and source commit
+        id: source
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_REF: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          python3 - <<'PY'
+          import os,re,subprocess
+          e=os.environ
+          sha=e['SOURCE_SHA']
+          assert re.fullmatch('[0-9a-f]{40}',sha),'invalid source SHA'
+          assert e['SOURCE_REPO']==e['GITHUB_REPOSITORY'],'unexpected source repository'
+          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==sha,'checkout SHA mismatch'
+          event=e['SOURCE_EVENT']
+          assert event in ('push','workflow_dispatch'),'unexpected source event'
+          tag=''
+          if event=='push':
+              tag=e['SOURCE_REF']
+              assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+',tag),'not a stable tag run'
+              resolved=subprocess.check_output(['git','rev-parse',f'refs/tags/{tag}^{{commit}}'],text=True).strip()
+              assert resolved==sha,'tag changed since originating run'
+          with open(e['GITHUB_OUTPUT'],'a') as out:
+              out.write(f'sha={sha}\ntag={tag}\nevent={event}\n')
+          PY
+      - name: Download successful arm64 build evidence from originating run
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: release-build-arm64
+          path: arm64-evidence
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Gate armhf strictly on validated arm64 .deb
+        id: gate
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path('arm64-evidence')
+          ready=False
+          try:
+              reports=list(root.rglob('result-arm64.json'))
+              assert len(reports)==1,'missing or ambiguous arm64 report'
+              report=json.loads(reports[0].read_text())
+              assert report['architecture']=='arm64' and report['status']=='PASS','arm64 was not validated'
+              assert report['backends']=={'konsole':'built-and-tested','qtermwidget':'built-and-tested'},'backend evidence missing'
+              name=report['package']
+              assert name.startswith('gpt2codex_') and name.endswith('_arm64.deb'),'invalid arm64 filename'
+              packages=list(root.rglob(name))
+              assert len(packages)==1,'missing or ambiguous arm64 package'
+              deb=packages[0]
+              assert hashlib.sha256(deb.read_bytes()).hexdigest()==report['sha256'],'arm64 digest mismatch'
+              assert subprocess.check_output(['dpkg-deb','-f',str(deb),'Architecture'],text=True).strip()=='arm64','arm64 package architecture mismatch'
+              ready=True
+          except (AssertionError,KeyError,ValueError,TypeError,OSError,subprocess.CalledProcessError) as exc:
+              print('ARMHF SKIPPED: arm64 evidence did not validate:',exc)
+              with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+                  summary.write('ARMHF NOT RUN: validated arm64 package was not available.\n')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+              out.write('ready='+('true' if ready else 'false')+'\n')
+          if ready: print('ARM64 validated: scheduling independent experimental armhf build')
+          PY
+
+  armhf:
+    name: Debian 13 / armhf (independent experimental)
+    needs: verify-arm64
+    if: needs.verify-arm64.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          ref: ${{ needs.verify-arm64.outputs.sha }}
+          persist-credentials: false
+      - id: images
+        name: Select pinned Debian and QEMU images
+        run: |
+          python3 - <<'PY'
+          import json,os
+          config=json.load(open('packaging/ci-lock.json'))
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+              out.write('debian='+config['images']['debian']['image']+'\n')
+              out.write('binfmt='+config['images']['binfmt']['image']+'\n')
+          PY
+      - name: Initialize explicit failure report
+        run: |
+          mkdir -p out .tmp/cargo-armhf
+          printf '{"architecture":"armhf","status":"FAIL","reason":"Experimental ARM32 build did not complete; see build.log"}\n' > out/result-armhf.json
+      - name: Register pinned QEMU ARM32 emulator
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392  # v3.6.0
+        with:
+          image: ${{ steps.images.outputs.binfmt }}
+          platforms: arm
+      - name: Build and test complete armhf package inside Debian 13
+        env:
+          IMAGE: ${{ steps.images.outputs.debian }}
+        run: |
+          set -o pipefail
+          docker run --rm --platform linux/arm/v7 -e G2C_ALPHA_CONTAINER=1 -e G2C_EXPECT_ARCH=armhf -v "$PWD:/src:ro" -v "$PWD/out:/out" -v "$PWD/.tmp/cargo-armhf:/cargo-cache" "$IMAGE" /bin/sh /src/gpt2codex-alpha-container.sh build 2>&1 | tee out/build.log
+      - name: Verify final armhf package and report
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,pathlib,subprocess
+          report=json.loads(pathlib.Path('out/result-armhf.json').read_text())
+          assert report['architecture']=='armhf' and report['status']=='PASS'
+          assert report['backends']=={'konsole':'built-and-tested','qtermwidget':'built-and-tested'}
+          deb=pathlib.Path('out/validated')/report['package']
+          assert deb.is_file() and deb.name.startswith('gpt2codex_') and deb.name.endswith('_armhf.deb')
+          assert hashlib.sha256(deb.read_bytes()).hexdigest()==report['sha256']
+          assert subprocess.check_output(['dpkg-deb','-f',str(deb),'Architecture'],text=True).strip()=='armhf'
+          subprocess.run(['python3','./gpt2codex-alpha.py','inspect','--deb',str(deb),'--arch','armhf'],check=True)
+          PY
+      - name: Preserve armhf diagnostics and validated package if available
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release-build-armhf
+          path: out/
+          if-no-files-found: warn
+
+  publish-armhf:
+    name: Add armhf to existing approved release
+    needs: [verify-arm64, armhf]
+    if: >-
+      needs.armhf.result == 'success' &&
+      needs.verify-arm64.outputs.tag != '' &&
+      needs.verify-arm64.outputs.event == 'push' &&
+      vars.RELEASE_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: stable-release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          ref: ${{ needs.verify-arm64.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: release-build-armhf
+          path: out
+      - name: Verify source tag, package provenance and write separate SHA manifest
+        env:
+          RELEASE_TAG: ${{ needs.verify-arm64.outputs.tag }}
+          SOURCE_SHA: ${{ needs.verify-arm64.outputs.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess
+          e=os.environ;tag=e['RELEASE_TAG'];sha=e['SOURCE_SHA']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+',tag)
+          assert subprocess.check_output(['git','rev-parse',f'refs/tags/{tag}^{{commit}}'],text=True).strip()==sha,'tag moved'
+          report=json.loads(pathlib.Path('out/result-armhf.json').read_text())
+          assert report['architecture']=='armhf' and report['status']=='PASS'
+          assert report['backends']=={'konsole':'built-and-tested','qtermwidget':'built-and-tested'}
+          name=report['package'];expected='gpt2codex_'+tag[1:]+'_armhf.deb'
+          assert name==expected,'version/architecture mismatch'
+          deb=pathlib.Path('out/validated')/name
+          assert deb.is_file() and hashlib.sha256(deb.read_bytes()).hexdigest()==report['sha256'],'digest mismatch'
+          assert subprocess.check_output(['dpkg-deb','-f',str(deb),'Architecture'],text=True).strip()=='armhf'
+          pathlib.Path('out/SHA256SUMS-armhf').write_text(report['sha256']+'  '+name+'\n')
+          pathlib.Path('out/ARMHF-REPORT.md').write_text('# Experimental armhf for '+tag+'\n\nValidated from workflow '+e['GITHUB_RUN_ID']+' and commit '+sha+'.\n\nSHA256: `'+report['sha256']+'`\n\nThis report supplements the original release manifest. No existing asset was replaced.\n')
+          PY
+      - name: Ensure release exists and no published assets are replaced
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify-arm64.outputs.tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release.json
+          python3 - <<'PY'
+          import json,os
+          release=json.load(open('release.json'))
+          tag=os.environ['RELEASE_TAG'];version=tag[1:]
+          assert release['tag_name']==tag and not release['draft'],'release not published'
+          names={item['name'] for item in release['assets']}
+          required={'gpt2codex_'+version+'_amd64.deb','gpt2codex_'+version+'_arm64.deb'}
+          assert required.issubset(names),'approved amd64/arm64 assets missing'
+          fresh={'gpt2codex_'+version+'_armhf.deb','SHA256SUMS-armhf','ARMHF-REPORT.md'}
+          assert names.isdisjoint(fresh),'armhf assets already exist; refusing overwrite'
+          PY
+      - name: Upload validated armhf without clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify-arm64.outputs.tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" "out/validated/gpt2codex_${RELEASE_TAG#v}_armhf.deb" out/SHA256SUMS-armhf out/ARMHF-REPORT.md --repo "$GITHUB_REPOSITORY"
