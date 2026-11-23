@@ -345,9 +345,13 @@ ldd() { trace "ldd $*"; if test "$G2C_FAIL" = elf; then printf 'library => not f
     def test_action_pins_and_default_publication_gate(self):
         lock=json.loads((ROOT/'packaging/ci-lock.json').read_text())
         workflow=(ROOT/'.github/workflows/release.yml').read_text()
+        followup=(ROOT/'.github/workflows/release-armhf.yml').read_text()
         for repo,value in lock['actions'].items():
             if repo=='actions/cache':
                 for operation in ['restore','save']:self.assertIn(repo+'/'+operation+'@'+value['commit'],workflow)
+            elif repo=='docker/setup-qemu-action':
+                self.assertNotIn(repo+'@',workflow)
+                self.assertIn(repo+'@'+value['commit'],followup)
             else:self.assertIn(repo+'@'+value['commit'],workflow)
         self.assertIn("vars.RELEASE_PUBLISH_ENABLED == 'true'",workflow)
         self.assertIn('environment: stable-release',workflow)
