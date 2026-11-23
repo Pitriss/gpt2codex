@@ -4,11 +4,17 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import tempfile
 import unittest
 from unittest import mock
 
-SCRIPT = Path(__file__).with_name("gpt2codex-github-queue.py")
+SCRIPT = (_G2C_REPO / 'gpt2codex-github-queue.py')
 spec = importlib.util.spec_from_file_location("g2c_github_queue", SCRIPT)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)

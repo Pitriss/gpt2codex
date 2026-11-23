@@ -33,9 +33,10 @@ if [ "$mode" = build ] || [ "$mode" = quick ]; then
     if [ "$mode" = quick ]; then
         cargo test --frozen --all-targets
         cargo build --frozen --bin gpt2codex
-        python3 -B ./gpt2codex-project-types-test.py
-        python3 ./gpt2codex-alpha-test.py --light
-        python3 ./gpt2codex-ci-test.py
+        python3 -B ./tests/integration/gpt2codex-project-types-test.py
+        python3 -B ./tests/unit/gpt2codex-queue-recovery-test.py
+        python3 ./tests/unit/gpt2codex-alpha-test.py --light
+        python3 ./tests/unit/gpt2codex-ci-test.py
         python3 ./gpt2codex-ci.py actionlint --destination /work/actionlint
         python3 ./gpt2codex-ci.py static --actionlint /work/actionlint/actionlint
         printf '{"scope":"quick","status":"PASS","release_validated":false}\n' > /out/quick.json
@@ -45,8 +46,9 @@ if [ "$mode" = build ] || [ "$mode" = quick ]; then
     arch=$(dpkg --print-architecture)
     deb=/work/gpt2codex_${version}_${arch}.deb
     python3 ./gpt2codex-alpha.py inspect --deb "$deb" --arch "$arch"
-    python3 ./gpt2codex-alpha-test.py
-    python3 ./gpt2codex-ci-test.py
+    python3 ./tests/unit/gpt2codex-alpha-test.py
+    python3 -B ./tests/unit/gpt2codex-queue-recovery-test.py
+    python3 ./tests/unit/gpt2codex-ci-test.py
     sh -n ./gpt2codex-alpha-container.sh
     lintian --fail-on error "$deb"
     mkdir -p /out/validated

@@ -4,6 +4,12 @@ import importlib.util
 import multiprocessing
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import tempfile
 import unittest
 import uuid
@@ -34,7 +40,7 @@ def fixture_worker(directory, key, observation, ready, release, complete=True):
 class DispatchTests(unittest.TestCase):
     def setUp(self):
         # tempfile parent explicitly stays in the existing project .tmp.
-        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent / '.tmp')
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2] / '.tmp')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.ledger = dispatch.Ledger(self.root)

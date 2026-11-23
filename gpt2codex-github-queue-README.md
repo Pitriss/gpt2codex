@@ -79,7 +79,7 @@ python3 ./gpt2codex-github-queue.py init-config
 vim ~/.config/gpt2codex/github-queue/config.json
 install -m 600 /dev/null ~/.config/gpt2codex/github-queue.token
 vim ~/.config/gpt2codex/github-queue.token
-python3 ./gpt2codex-github-queue-test.py
+python3 ./tests/unit/gpt2codex-github-queue-test.py
 python3 ./gpt2codex-github-queue.py check
 ```
 
@@ -275,8 +275,8 @@ publisher ho nevolá. Nemazat durable state ani claim pro opravu publikace.
 Offline ověření bez skutečného GitHub POST, Codex turnu či relace:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/.tmp" python3 ./gpt2codex-queue-handoff-test.py > .log/queue-handoff-tests.log 2>&1
-PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/.tmp" python3 ./gpt2codex-queue-screen-test.py > .log/queue-handoff-screen-regressions.log 2>&1
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/.tmp" python3 ./tests/unit/gpt2codex-queue-handoff-test.py > .log/queue-handoff-tests.log 2>&1
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/.tmp" python3 ./tests/unit/gpt2codex-queue-screen-test.py > .log/queue-handoff-screen-regressions.log 2>&1
 ```
 
 Aktuální source checkout potřebuje `gpt2codex-github-queue.py` i nový
@@ -403,7 +403,7 @@ mechanismus; při ztrátě `.log` trvá durable queue claim a nic se nereplayuje
 Cílené ověření (mock není E2E důkaz):
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/.tmp" python3 gpt2codex-queue-screen-test.py
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/.tmp" python3 tests/unit/gpt2codex-queue-screen-test.py
 python3 gpt2codex-queue-screen-smoke.py
 ```
 

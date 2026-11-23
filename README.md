@@ -34,7 +34,7 @@ Debian 13 development packages: Rust/Cargo >= 1.85, CMake, g++, Qt6 >= 6.8,
 ```sh
 cargo test --locked --offline --all-targets
 cargo build --locked --offline --release
-python3 ./gpt2codex-project-icons-test.py
+python3 ./tests/integration/gpt2codex-project-icons-test.py
 ```
 
 Offline Cargo needs an already populated cache; fetch with `cargo fetch

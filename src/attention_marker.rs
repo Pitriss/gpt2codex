@@ -701,8 +701,14 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let root = PathBuf::from(std::env::var_os("TMPDIR").expect("isolated TMPDIR required"))
-                .join(format!("marker-unit-{}", nonce().unwrap()));
+            // The managed project .tmp can be a symlink. Resolve only the test
+            // scratch parent; production runtime() retains its O_NOFOLLOW checks.
+            let scratch = PathBuf::from(
+                std::env::var_os("TMPDIR").expect("isolated TMPDIR required"),
+            )
+            .canonicalize()
+            .expect("isolated TMPDIR must exist");
+            let root = scratch.join(format!("marker-unit-{}", nonce().unwrap()));
             fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
             let old = std::env::var_os("XDG_RUNTIME_DIR");
             std::env::set_var("XDG_RUNTIME_DIR", &root);

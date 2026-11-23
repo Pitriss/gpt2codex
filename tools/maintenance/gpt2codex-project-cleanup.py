@@ -79,7 +79,7 @@ def snapshot(cli, config, queue_config):
 
 
 def main():
-    repo = Path(__file__).resolve().parent
+    repo = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--dry-run', action='store_true')

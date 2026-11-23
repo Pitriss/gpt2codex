@@ -5,12 +5,18 @@ import io
 import json
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-ROOT=Path(__file__).resolve().parent
+ROOT=Path(__file__).resolve().parents[2]
 
 
 def module(name,file):
@@ -19,7 +25,7 @@ def module(name,file):
 
 
 ci=module('ci','gpt2codex-ci.py')
-packaging=module('packaging_tests','gpt2codex-alpha-test.py')
+packaging=module('packaging_tests','tests/unit/gpt2codex-alpha-test.py')
 
 
 class CITests(unittest.TestCase):
@@ -139,9 +145,9 @@ class CITests(unittest.TestCase):
         self.assertTrue(light)
         container=(ROOT/'gpt2codex-alpha-container.sh').read_text()
         self.assertIn('cargo test --frozen --all-targets',container)
-        self.assertIn('python3 ./gpt2codex-alpha-test.py\n',container)
-        self.assertIn('python3 ./gpt2codex-alpha-test.py --light',container)
-        self.assertIn('python3 -B ./gpt2codex-project-types-test.py',container)
+        self.assertIn('python3 ./tests/unit/gpt2codex-alpha-test.py\n',container)
+        self.assertIn('python3 ./tests/unit/gpt2codex-alpha-test.py --light',container)
+        self.assertIn('python3 -B ./tests/integration/gpt2codex-project-types-test.py',container)
 
     def test_plan_cli_outputs_boolean_and_matrix_values_for_github(self):
         event=self.base/'event.json';event.write_text('{"inputs":{}}');output=self.base/'outputs'

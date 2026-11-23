@@ -8,6 +8,12 @@ import copy
 import json
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import subprocess
 import sys
 import tempfile
@@ -18,7 +24,7 @@ sys.dont_write_bytecode = True
 import gpt2codex_queue_dispatch as dispatch
 
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parents[2]
 BRIDGE = REPO / 'target/debug/gpt2codex'
 
 
@@ -40,9 +46,8 @@ class AdmissionTests(unittest.TestCase):
         for name in ('one', 'two'):
             root = self.base / name
             root.mkdir()
-            (root / '.git').mkdir()
             (self.config.parent / 'projects' / (name + '.toml')).write_text(
-                '[project]\nid = "' + name + '"\ndirectory = "' + name + '"\n')
+                '[project]\nid = "' + name + '"\ndirectory = "' + name + '"\ntype = "non-git"\n')
         self.probe = dispatch.RustSupervisorProbe(BRIDGE, self.config, self.namespace)
         self.ledger = dispatch.Ledger(self.base)
         self.env = {'HOME': str(self.home), 'PATH': '/nonexistent', 'LANG': 'C'}

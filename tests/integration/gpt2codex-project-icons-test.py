@@ -3,6 +3,12 @@
 import json
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import re
 import subprocess
 import tempfile
@@ -15,11 +21,11 @@ def main():
     logs = Path(tempfile.mkdtemp(prefix="project-icons-", dir=root / ".log")).resolve()
     with tempfile.TemporaryDirectory(prefix="project-icons-", dir=root / ".tmp") as scratch:
         fixture = Path(scratch).resolve()
-        for name in ["home", "config/chatgpt2codex/projects", "state", "runtime", "screens", "tmp", "repos/bridge/.git"]:
+        for name in ["home", "config/chatgpt2codex/projects", "state", "runtime", "screens", "tmp", "repos/bridge"]:
             (fixture / name).mkdir(parents=True, exist_ok=True, mode=0o700)
         config = fixture / "config/chatgpt2codex"
         (config / "config.toml").write_text("[workspace]\nproject_dir=" + json.dumps(str(fixture / "repos")) + "\n")
-        (config / "projects/gpt2codex.toml").write_text("[project]\nid='gpt2codex'\ndirectory='bridge'\n")
+        (config / "projects/gpt2codex.toml").write_text("[project]\nid='gpt2codex'\ndirectory='bridge'\ntype='non-git'\n")
         env = {
             "PATH": os.environ.get("PATH", os.defpath), "HOME": str(fixture / "home"),
             "XDG_CONFIG_HOME": str(fixture / "config"), "XDG_STATE_HOME": str(fixture / "state"),
@@ -28,14 +34,16 @@ def main():
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "GIT_OPTIONAL_LOCKS": "0",
             "QT_QPA_PLATFORM": "offscreen", "QT_QPA_PLATFORMTHEME": "generic",
         }
-        built = subprocess.run(["bash", "./gpt2codex-p0ic-qt6-test-v2.sh"], env=env,
+        built = subprocess.run(["bash", "./tests/integration/gpt2codex-p0ic-qt6-test-v2.sh"], env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
         (logs / "build-driver.log").write_bytes(built.stdout)
         assert built.returncode == 0, f"release build failed; {logs}/build-driver.log"
         detail = Path(re.search(rb"^DETAILS=(.+)$", built.stdout, re.M)[1].decode())
         build_dir = re.search(r"Build files have been written to: (.+)", detail.read_text())[1]
         with (logs / "ctest.log").open("w") as output:
-            tested = subprocess.run(["ctest", "--test-dir", build_dir, "--output-on-failure"], env=env,
+            # Keep the synthetic Unix socket path below the AF_UNIX limit.
+            tested = subprocess.run(["ctest", "--test-dir", build_dir, "--output-on-failure"],
+                                   env={**env, "G2C_MARKER_FIXTURE_BASE": str(root / ".tmp")},
                                     stdout=output, stderr=subprocess.STDOUT, timeout=60)
         summary = {"release_build": "PASS", "build_directory": build_dir, "build_log": str(detail),
                    "ctest": "PASS" if tested.returncode == 0 else "FAIL",

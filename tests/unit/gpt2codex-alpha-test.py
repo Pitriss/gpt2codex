@@ -6,6 +6,12 @@ import io
 import json
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import re
 import shutil
 import subprocess
@@ -15,7 +21,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('alpha', ROOT/'gpt2codex-alpha.py')
 alpha = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(alpha)
@@ -36,6 +42,14 @@ class AlphaTests(unittest.TestCase):
         for p in ['Cargo.toml','Cargo.lock','LICENSE','README.md','AGENTS.md','.gitignore','src/lib.rs','gui/main.cpp','.ai/templates/.project_codex.md']:
             file=root/p;file.parent.mkdir(parents=True,exist_ok=True);file.write_text('public synthetic source\n')
         return root
+
+    def test_relocated_tests_and_tools_are_release_sources(self):
+        paths = {str(path) for path in alpha.source_files()}
+        self.assertIn('tests/unit/gpt2codex-alpha-test.py', paths)
+        self.assertIn('tests/integration/gpt2codex-project-types-test.py', paths)
+        self.assertIn('tools/diagnostics/gpt2codex-terminal-diagnostics.py', paths)
+        self.assertIn('tools/maintenance/gpt2codex-project-cleanup.py', paths)
+        self.assertNotIn('gpt2codex-project-types-test.py', paths)
 
     def test_candidate_includes_untracked_source_excludes_private_and_cache(self):
         root=self.fixture_source()

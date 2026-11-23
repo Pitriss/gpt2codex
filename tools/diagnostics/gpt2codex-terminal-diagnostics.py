@@ -19,7 +19,7 @@ import termios
 import time
 import threading
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parents[2]
 MARKER = "gpt2codex-synthetic-terminal-v1\n"
 
 # GNU screen 4.9.1 display.c from the official release tarball. No download,
@@ -269,7 +269,7 @@ def main(visual=False):
         raise RuntimeError("visual comparison requires a standalone ordinary terminal, outside screen/tmux")
     binary = REPO / "target/release/gpt2codex-backend-tests"
     if not binary.is_file():
-        raise RuntimeError("build first: QT_QPA_PLATFORMTHEME=generic bash ./gpt2codex-p0ic-qt6-test-v2.sh")
+        raise RuntimeError("build first: QT_QPA_PLATFORMTHEME=generic bash ./tests/integration/gpt2codex-p0ic-qt6-test-v2.sh")
     output = Path(tempfile.mkdtemp(prefix="terminal-diagnostics-", dir=REPO / ".log"))
     report = {"phase": "A", "host_terminal": terminal_metadata(), "cases": {},
         "live_sessions_accessed": False, "codex_started": False, "private_output_captured": False}

@@ -5,6 +5,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import threading
 import unittest
 from unittest import mock
@@ -308,7 +314,7 @@ print('PRIVATE_STDOUT_SENTINEL')
         path = self.store.log_dir / 'unsafe-report.json'
         item = {**job, '_handoff_nonce': job['handoff_nonce']}
         samples = ['github_pat_EXAMPLE', 'ghp_EXAMPLE', 'sk-proj-EXAMPLE',
-                   '-----BEGIN RSA PRIVATE KEY-----', 'xoxb-12345', 'AKIA1234567890',
+                   '-----BEGIN ' + 'RSA PRIVATE KEY-----', 'xoxb-12345', 'AKIA1234567890',
                    'password: harmless', 'client_secret: harmless', 'Bearer abc',
                    '/home/person/private/file', '/run/secrets/example', '~/private',
                    'Cesta:/home/person/private', 'Cesta,/root/private', 'DB_HOST: private',

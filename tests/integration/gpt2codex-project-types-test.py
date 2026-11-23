@@ -6,6 +6,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import subprocess
 import tempfile
 import unittest
@@ -14,7 +20,7 @@ from unittest import mock
 import gpt2codex_queue_project as project
 import gpt2codex_queue_screen as screen
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('queue_types', REPO / 'gpt2codex-github-queue.py')
 queue = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(queue)
@@ -176,7 +182,8 @@ else: sys.exit(91)
         with mock.patch.object(queue, 'require_runnable_backend'), \
              mock.patch.object(queue, 'validated_remote', return_value=self.item), \
              mock.patch.object(project, 'validate_start', side_effect=changed), \
-             mock.patch.object(project, 'anchor_ready'), \
+             mock.patch.object(project, 'anchor_ready', return_value=(
+                 {'full_id': '123.g2c-plain'}, {'pid': 123, 'number': 0})), \
              mock.patch.object(screen, 'require_chatgpt'):
             with self.assertRaisesRegex(queue.QueueError, 'preclaim changed'):
                 queue.execute_claimed(mock.Mock(), self.store, self.cfg, 1, 'project-screen')

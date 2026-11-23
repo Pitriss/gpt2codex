@@ -10,6 +10,12 @@ import json
 import os
 import socket
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import sys
 import tempfile
 import types
@@ -25,7 +31,7 @@ def queue_module():
     # Inject a harmless stub only for offline control-plane tests.
     sys.modules.setdefault('gpt2codex_queue_handoff', types.ModuleType('gpt2codex_queue_handoff'))
     spec = importlib.util.spec_from_file_location('gpt2codex_queue_under_test',
-                                                  Path(__file__).with_name('gpt2codex-github-queue.py'))
+                                                  (_G2C_REPO / 'gpt2codex-github-queue.py'))
     result = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(result)
     return result
@@ -171,10 +177,15 @@ class CanaryTests(unittest.TestCase):
                'project_screen_canary': True}
         with mock.patch.object(q, 'require_runnable_backend'), \
              mock.patch.object(q, 'validated_remote', return_value=self.item), \
+             mock.patch('gpt2codex_queue_recovery._status',
+                        return_value={'state': 'detached'}) as status, \
+             mock.patch('gpt2codex_queue_recovery._cli') as recovery_cli, \
              mock.patch.object(project, 'anchor_ready',
                                side_effect=project.ProjectScreenError('project_busy')):
-            with self.assertRaises(q.QueueError):
+            with self.assertRaisesRegex(q.QueueError, 'project-screen waiting'):
                 q.execute_claimed(api, self.store, cfg, 27, 'project-screen')
+        status.assert_called_once()
+        recovery_cli.assert_not_called()
         self.assertEqual(self.store.data['jobs']['27']['status'], 'approved-project-screen')
         api.comment.assert_not_called()
 

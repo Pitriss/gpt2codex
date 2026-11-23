@@ -12,6 +12,12 @@ import fcntl
 import json
 import os
 from pathlib import Path
+
+# Repository imports remain explicit when this test is run directly.
+import sys as _g2c_sys
+_G2C_REPO = Path(__file__).resolve().parents[2]
+if str(_G2C_REPO) not in _g2c_sys.path:
+    _g2c_sys.path.insert(0, str(_G2C_REPO))
 import pty
 import select
 import shlex
@@ -25,7 +31,7 @@ import termios
 import time
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "target/release/gpt2codex"
 
 
@@ -153,7 +159,7 @@ if kind == "tmux" and (root / "exit-code").exists():
             shutil.copytree(fixture / "c", gui_config / "chatgpt2codex")
             build_env = dict(env, PATH=os.environ["PATH"], XDG_CONFIG_HOME=str(gui_config),
                 QT_QPA_PLATFORMTHEME="generic", QT_QPA_PLATFORM="offscreen", GIT_OPTIONAL_LOCKS="0")
-            build = subprocess.run(["bash", "./gpt2codex-p0ic-qt6-test-v2.sh"], cwd=ROOT,
+            build = subprocess.run(["bash", "./tests/integration/gpt2codex-p0ic-qt6-test-v2.sh"], cwd=ROOT,
                 env=build_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
             (logs / "gui-build-driver.log").write_bytes(build.stdout)
             assert build.returncode == 0, f"GUI build failed; inspect {logs}"

@@ -52,7 +52,7 @@ Local CLI examples (start commands require separate explicit operator approval):
 ./target/release/gpt2codex session attach --id example --multiplexer tmux
 ```
 
-Isolated regression tests: `python3 ./gpt2codex-multiplexer-test.py --backends`.
+Isolated regression tests: `python3 ./tests/integration/gpt2codex-multiplexer-test.py --backends`.
 They replace Codex with a synthetic fixture-local executable, use private
 registries/HOME/SCREENDIR/tmux sockets and leave all user sessions alone. If tmux
 is absent its real PTY cases are reported as skipped. A test-only binary may be
@@ -69,15 +69,15 @@ cause. No production terminal setting is changed speculatively.
 Build with the existing root helper, then run from the repository root:
 
 ```sh
-QT_QPA_PLATFORMTHEME=generic bash ./gpt2codex-p0ic-qt6-test-v2.sh
+QT_QPA_PLATFORMTHEME=generic bash ./tests/integration/gpt2codex-p0ic-qt6-test-v2.sh
 ```
 
 ```sh
-python3 ./gpt2codex-terminal-diagnostics.py --self-test
+python3 ./tools/diagnostics/gpt2codex-terminal-diagnostics.py --self-test
 ```
 
 ```sh
-python3 ./gpt2codex-terminal-diagnostics.py
+python3 ./tools/diagnostics/gpt2codex-terminal-diagnostics.py
 ```
 
 The one root diagnostic helper creates its own `SCREENDIR`, HOME and screenrc
@@ -100,7 +100,7 @@ For desktop comparison, launch from an ordinary standalone terminal outside
 screen/tmux:
 
 ```sh
-python3 ./gpt2codex-terminal-diagnostics.py --visual
+python3 ./tools/diagnostics/gpt2codex-terminal-diagnostics.py --visual
 ```
 
 This shows the same synthetic pattern in the ordinary terminal for seven
@@ -244,7 +244,7 @@ The `offscreen` UI style may not be the same style as a desktop session; run wit
 
 Required core build packages: `qt6-base-dev`, `cmake`, `g++`. Install at least one backend development stack described below. **No package installation is performed by the helper.** Debian 13 provides Qt6 QTermWidget development files in `libqtermwidget-dev` (not in a package named `libqtermwidget6-dev`).
 
-From the project root use `bash ./gpt2codex-p0ic-qt6-test-v2.sh`. The GUI build uses the installed Qt6 and qtermwidget6 CMake package configuration, not a combined pkg-config preflight. Debian 13 QTermWidget6 also needs the unversioned `libutf8proc.so` development linker library; `libutf8proc3` alone is insufficient. Install `libutf8proc-dev` using `sudo apt-get install libutf8proc-dev` before building. CMake checks this dependency and reports a focused error if it is absent. It compiles an executable at `target/release/gpt2codex-gui` and invokes its read-only `--self-test`. It does **not** open GUI windows or attach existing sessions during testing.
+From the project root use `bash ./tests/integration/gpt2codex-p0ic-qt6-test-v2.sh`. The GUI build uses the installed Qt6 and qtermwidget6 CMake package configuration, not a combined pkg-config preflight. Debian 13 QTermWidget6 also needs the unversioned `libutf8proc.so` development linker library; `libutf8proc3` alone is insufficient. Install `libutf8proc-dev` using `sudo apt-get install libutf8proc-dev` before building. CMake checks this dependency and reports a focused error if it is absent. It compiles an executable at `target/release/gpt2codex-gui` and invokes its read-only `--self-test`. It does **not** open GUI windows or attach existing sessions during testing.
 
 To open the GUI separately:
 
@@ -386,7 +386,7 @@ affecting session polling or terminal attachments.
 Run from the repository root:
 
 ```sh
-python3 ./gpt2codex-project-icons-test.py
+python3 ./tests/integration/gpt2codex-project-icons-test.py
 ```
 
 This root helper invokes the existing release GUI build/self-test workflow and
@@ -451,7 +451,7 @@ approval coverage or automatic UserPromptSubmit clearing.
 Run the isolated release build, safe self-test and all GUI/backend regressions:
 
 ```sh
-python3 ./gpt2codex-attention-test.py
+python3 ./tests/integration/gpt2codex-attention-test.py
 ```
 
 This helper builds the Rust CLI and runs focused marker/CLI tests, then uses the existing CMake/CTest targets with fresh build/output and
@@ -493,7 +493,7 @@ approvals, automatic hooks and SO_PEERCRED transport remain out of scope.
 Targeted synthetic checks, from the ready repository root:
 
 ```sh
-python3 ./gpt2codex-attention-test.py --diagnostic-only
+python3 ./tests/integration/gpt2codex-attention-test.py --diagnostic-only
 ```
 
 This uses a fresh private Rust build/marker test target, synthetic Python
@@ -526,7 +526,7 @@ For the input-side GNU screen parser only, using the reviewed cached upstream
 4.9.1 `display.c` when it is still present:
 
 ```sh
-python3 ./gpt2codex-terminal-diagnostics.py --mouse-test --screen-source .tmp/p0m-diagnosis-t1n33edr/screen-display.c
+python3 ./tools/diagnostics/gpt2codex-terminal-diagnostics.py --mouse-test --screen-source .tmp/p0m-diagnosis-t1n33edr/screen-display.c
 ```
 
 Otherwise supply the same `display.c` from the official
