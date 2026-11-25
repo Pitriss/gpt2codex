@@ -169,7 +169,7 @@ jobs:
       - name: Verify final armhf package and report
         run: |
           python3 - <<'PY'
-          import hashlib,json,pathlib,subprocess
+          import hashlib,json,os,pathlib,subprocess,tempfile
           assert pathlib.Path('out/vm-exit').read_text().strip()=='0','ARMHF VM did not complete successfully'
           platform=dict(line.split('=',1) for line in pathlib.Path('out/vm-platform.txt').read_text().splitlines())
           assert platform['execution']=='qemu-system-arm' and platform['architecture']=='armhf'
@@ -182,7 +182,10 @@ jobs:
           assert deb.is_file() and deb.name.startswith('gpt2codex_') and deb.name.endswith('_armhf.deb')
           assert hashlib.sha256(deb.read_bytes()).hexdigest()==report['sha256']
           assert subprocess.check_output(['dpkg-deb','-f',str(deb),'Architecture'],text=True).strip()=='armhf'
-          subprocess.run(['python3','./gpt2codex-alpha.py','inspect','--deb',str(deb),'--arch','armhf'],check=True)
+          # A clean checkout has no .tmp; use disposable runner-local scratch.
+          with tempfile.TemporaryDirectory(prefix='g2c-armhf-inspect-',dir=os.environ['RUNNER_TEMP']) as scratch:
+              subprocess.run(['python3','./gpt2codex-alpha.py','inspect','--deb',str(deb),'--arch','armhf'],
+                             env={**os.environ,'TMPDIR':scratch},check=True)
           PY
       - name: Preserve armhf diagnostics and validated package if available
         if: always()

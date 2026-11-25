@@ -137,6 +137,53 @@ class CITests(unittest.TestCase):
         self.assertIn('"$VM_IMAGE" /bin/sh /src/packaging/armhf-vm.sh run',workflow)
         self.assertNotIn('steps.images.outputs.debian }}',workflow)
 
+    def test_armhf_final_validation_uses_disposable_runner_tmpdir(self):
+        import hashlib
+        workflow=(ROOT/'.github/workflows/release-armhf.yml').read_text()
+        step=workflow.split('name: Verify final armhf package and report',1)[1]
+        code=step.split("python3 - <<'PY'\n",1)[1].split('\n          PY',1)[0]
+        code='\n'.join(line[10:] for line in code.splitlines())
+        work=self.base/'clean-checkout';work.mkdir()
+        runner_temp=self.base/'runner-temp';runner_temp.mkdir()
+        out=work/'out';(out/'validated').mkdir(parents=True)
+        # Inert armhf package: dpkg-deb reads metadata, never runs the payload.
+        tree=self.base/'package';(tree/'DEBIAN').mkdir(parents=True)
+        version=packaging.alpha.VERSION
+        (tree/'DEBIAN/control').write_text(
+            f'Package: gpt2codex\nVersion: {version}\nArchitecture: armhf\n'
+            'Maintainer: Synthetic fixture\nDescription: inert CI fixture\n')
+        deb=out/'validated'/f'gpt2codex_{version}_armhf.deb'
+        subprocess.run(['dpkg-deb','--build',str(tree),str(deb)],check=True,capture_output=True)
+        (out/'vm-exit').write_text('0\n')
+        (out/'vm-platform.txt').write_text('execution=qemu-system-arm\narchitecture=armhf\n'
+            'machine=armv7l\nbits=32\nkernel=fixture-armmp-lpae\nproc_generation=consistent\n')
+        report={'architecture':'armhf','status':'PASS','package':deb.name,
+                'sha256':hashlib.sha256(deb.read_bytes()).hexdigest(),
+                'backends':{'konsole':'built-and-tested','qtermwidget':'built-and-tested'}}
+        (out/'result-armhf.json').write_text(json.dumps(report))
+        # Exercise the exact workflow code; the synthetic inspector verifies
+        # the subprocess environment without running or installing ARM binaries.
+        (work/'gpt2codex-alpha.py').write_text(
+            'import os,pathlib,tempfile\n'
+            'scratch=pathlib.Path(os.environ["TMPDIR"])\n'
+            'assert scratch.parent == pathlib.Path(os.environ["RUNNER_TEMP"])\n'
+            'assert scratch.is_dir() and not pathlib.Path(".tmp").exists()\n'
+            'with tempfile.TemporaryDirectory(prefix="alpha-inspect-",dir=scratch): pass\n'
+            'print("synthetic inspector passed")\n')
+        env={**os.environ,'RUNNER_TEMP':str(runner_temp)};env.pop('TMPDIR',None)
+        cp=subprocess.run(['python3','-c',code],cwd=work,env=env,capture_output=True,text=True)
+        self.assertEqual(cp.returncode,0,cp.stderr)
+        self.assertIn('synthetic inspector passed',cp.stdout)
+        self.assertFalse((work/'.tmp').exists())
+        self.assertEqual(list(runner_temp.iterdir()),[])
+        # A failed inspector is still fatal and scratch is still removed.
+        with (work/'gpt2codex-alpha.py').open('a') as inspector:
+            inspector.write('raise SystemExit(17)\n')
+        cp=subprocess.run(['python3','-c',code],cwd=work,env=env,capture_output=True,text=True)
+        self.assertNotEqual(cp.returncode,0)
+        self.assertIn('returned non-zero exit status 17',cp.stderr)
+        self.assertEqual(list(runner_temp.iterdir()),[])
+
     def test_push_api_completeness_errors_and_renames(self):
         event={'before':'a'*40,'after':'b'*40}
         good={'status':'ahead','files':[{'filename':'README.md'}]}
