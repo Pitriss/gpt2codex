@@ -113,10 +113,20 @@ jobs:
         name: Select pinned Debian and QEMU images
         run: |
           python3 - <<'PY'
-          import json,os
+          import json,os,re
           config=json.load(open('packaging/ci-lock.json'))
+          # Use individual OCI platform manifests, not the shared index digest.
+          # The classic Docker image store cannot bind one digest to two platforms.
+          debian=config['images']['debian']
+          prepare=debian['platforms']['arm/v7']
+          vm=debian['platforms']['amd64']
+          assert all(re.fullmatch(r'sha256:[0-9a-f]{64}',v) for v in (prepare,vm)), 'invalid Debian platform digest'
+          assert prepare!=vm, 'Debian platform digests must differ'
+          assert debian['image'].startswith('debian@sha256:'), 'unexpected Debian image repository'
+          assert debian['image'] not in ('debian@'+prepare,'debian@'+vm), 'platform digest must not be the shared index'
           with open(os.environ['GITHUB_OUTPUT'],'a') as out:
-              out.write('debian='+config['images']['debian']['image']+'\n')
+              out.write('debian_armhf=debian@'+prepare+'\n')
+              out.write('debian_amd64=debian@'+vm+'\n')
               out.write('binfmt='+config['images']['binfmt']['image']+'\n')
           PY
       - name: Initialize explicit failure report
@@ -130,11 +140,17 @@ jobs:
           platforms: arm
       - name: Build and test complete armhf package under a Debian ARMv7 kernel
         env:
-          IMAGE: ${{ steps.images.outputs.debian }}
+          PREPARE_IMAGE: ${{ steps.images.outputs.debian_armhf }}
+          VM_IMAGE: ${{ steps.images.outputs.debian_amd64 }}
           SOURCE_SHA: ${{ needs.verify-arm64.outputs.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          # Resolve and verify both images before the expensive guest preparation.
+          docker pull --platform linux/arm/v7 "$PREPARE_IMAGE"
+          docker pull --platform linux/amd64 "$VM_IMAGE"
+          test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$PREPARE_IMAGE")" = linux/arm
+          test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$VM_IMAGE")" = linux/amd64
           vm=$(mktemp -d "$RUNNER_TEMP/g2c-armhf-vm.XXXXXX")
           cid=''
           cleanup() {
@@ -142,14 +158,14 @@ jobs:
             rm -rf -- "$vm"
           }
           trap cleanup EXIT
-          cid=$(docker create --platform linux/arm/v7 -e G2C_ARMHF_VM_MODE=prepare -v "$PWD:/src:ro" "$IMAGE" /bin/sh /src/packaging/armhf-vm.sh prepare)
+          cid=$(docker create --pull=never --platform linux/arm/v7 -e G2C_ARMHF_VM_MODE=prepare -v "$PWD:/src:ro" "$PREPARE_IMAGE" /bin/sh /src/packaging/armhf-vm.sh prepare)
           docker start -a "$cid" 2>&1 | tee out/vm-prepare.log
           test "$(docker inspect -f '{{.State.ExitCode}}' "$cid")" = 0
           docker export "$cid" > "$vm/rootfs.tar"
           docker rm "$cid" >/dev/null
           cid=''
           git archive --format=tar "$SOURCE_SHA" > "$vm/source.tar"
-          docker run --rm --platform linux/amd64 -e G2C_ARMHF_VM_MODE=run -v "$vm:/vm" -v "$PWD:/src:ro" -v "$PWD/out:/out" "$IMAGE" /bin/sh /src/packaging/armhf-vm.sh run 2>&1 | tee out/build.log
+          docker run --rm --pull=never --platform linux/amd64 -e G2C_ARMHF_VM_MODE=run -v "$vm:/vm" -v "$PWD:/src:ro" -v "$PWD/out:/out" "$VM_IMAGE" /bin/sh /src/packaging/armhf-vm.sh run 2>&1 | tee out/build.log
       - name: Verify final armhf package and report
         run: |
           python3 - <<'PY'

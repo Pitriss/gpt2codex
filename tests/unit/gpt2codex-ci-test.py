@@ -100,6 +100,43 @@ class CITests(unittest.TestCase):
         self.assertIn('G2C_ALPHA_CONTAINER=1 G2C_EXPECT_ARCH=armhf /bin/sh /src/gpt2codex-alpha-container.sh build',vm)
         self.assertNotIn('DEB_BUILD_OPTIONS=',vm)
 
+    def test_armhf_vm_uses_distinct_pinned_platform_images(self):
+        workflow=(ROOT/'.github/workflows/release-armhf.yml').read_text()
+        step=workflow.split('name: Select pinned Debian and QEMU images',1)[1]
+        code=step.split("python3 - <<'PY'\n",1)[1].split('\n          PY',1)[0]
+        code='\n'.join(line[10:] for line in code.splitlines())
+        config=json.loads((ROOT/'packaging/ci-lock.json').read_text())
+        lock=self.base/'packaging/ci-lock.json';lock.parent.mkdir()
+        output=self.base/'images'
+        env={**os.environ,'GITHUB_OUTPUT':str(output)}
+        def select(value):
+            if output.exists():output.unlink()
+            lock.write_text(json.dumps(value))
+            return subprocess.run(['python3','-c',code],cwd=self.base,env=env,capture_output=True,text=True)
+        cp=select(config)
+        self.assertEqual(cp.returncode,0,cp.stderr)
+        values=dict(line.split('=',1) for line in output.read_text().splitlines())
+        debian=config['images']['debian']
+        self.assertEqual(values,{'debian_armhf':'debian@'+debian['platforms']['arm/v7'],
+                                 'debian_amd64':'debian@'+debian['platforms']['amd64'],
+                                 'binfmt':config['images']['binfmt']['image']})
+        self.assertNotEqual(values['debian_armhf'],values['debian_amd64'])
+        for invalid in (debian['platforms']['arm/v7'],debian['image'].split('@')[1],'trixie-slim'):
+            with self.subTest(invalid=invalid):
+                bad=json.loads(json.dumps(config))
+                bad['images']['debian']['platforms']['amd64']=invalid
+                self.assertNotEqual(select(bad).returncode,0)
+                self.assertFalse(output.exists())
+        self.assertIn('PREPARE_IMAGE: ${{ steps.images.outputs.debian_armhf }}',workflow)
+        self.assertIn('VM_IMAGE: ${{ steps.images.outputs.debian_amd64 }}',workflow)
+        self.assertIn('docker pull --platform linux/arm/v7 "$PREPARE_IMAGE"',workflow)
+        self.assertIn('docker pull --platform linux/amd64 "$VM_IMAGE"',workflow)
+        self.assertIn('docker create --pull=never --platform linux/arm/v7',workflow)
+        self.assertIn('docker run --rm --pull=never --platform linux/amd64',workflow)
+        self.assertIn('"$PREPARE_IMAGE" /bin/sh /src/packaging/armhf-vm.sh prepare',workflow)
+        self.assertIn('"$VM_IMAGE" /bin/sh /src/packaging/armhf-vm.sh run',workflow)
+        self.assertNotIn('steps.images.outputs.debian }}',workflow)
+
     def test_push_api_completeness_errors_and_renames(self):
         event={'before':'a'*40,'after':'b'*40}
         good={'status':'ahead','files':[{'filename':'README.md'}]}
