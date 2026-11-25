@@ -10,6 +10,20 @@ verification before automatic publication. A normal branch push does not
 run the release workflow. Manual dispatch is diagnostic, never publishing.
 Existing Debian amd64 acceptance gates and experimental ARM builds remain.
 
+## ARMHF experimental execution (2026-11-25)
+
+QEMU linux-user 9.2.2 synthesizes the start ticks of a process reading its own
+`/proc/PID/stat`. CI run 45588962319 measured 155414 versus the kernel value
+155413 read by another process. The generation comparison must stay exact.
+ARMHF follow-up therefore uses linux-user only to prepare a frozen Debian
+ARMHF guest, then runs the unchanged complete package build and all tests
+under its ARMv7 LPAE kernel in QEMU full-system mode. Both the guest kernel
+and system emulator are installed from the signed CI snapshot. A successful
+guest exit, consistent proc generation, and normal package validation are
+required for acceptance/publication. The first hosted full-system run is
+still required to verify boot, timing and test compatibility. ARMHF remains
+experimental and non-blocking, and manual dispatch cannot publish.
+
 ## Historical first-alpha preparation (2026-10-28)
 
 The original alpha package version was `0.1.0~alpha1`; its workflow was `.github/workflows/alpha.yml`.

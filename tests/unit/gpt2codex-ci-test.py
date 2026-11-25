@@ -86,6 +86,19 @@ class CITests(unittest.TestCase):
         self.assertIn("vars.RELEASE_PUBLISH_ENABLED == 'true'",followup)
         self.assertIn('environment: stable-release',followup)
         self.assertNotIn('--clobber',followup)
+        self.assertIn('git archive --format=tar "$SOURCE_SHA"',followup)
+        self.assertIn('/src/packaging/armhf-vm.sh prepare',followup)
+        self.assertIn('/src/packaging/armhf-vm.sh run',followup)
+        self.assertNotIn('/src/gpt2codex-alpha-container.sh build',followup)
+        self.assertEqual(followup.count("pathlib.Path('out/vm-exit').read_text().strip()=='0'"),2)
+        self.assertEqual(followup.count("platform['proc_generation']=='consistent'"),2)
+        vm=(ROOT/'packaging/armhf-vm.sh').read_text()
+        self.assertIn('linux-image-armmp-lpae',vm)
+        self.assertIn('qemu-system-arm',vm)
+        self.assertIn('test "$$" = 1',vm)
+        self.assertIn('test "$own_ticks" = "$other_ticks"',vm)
+        self.assertIn('G2C_ALPHA_CONTAINER=1 G2C_EXPECT_ARCH=armhf /bin/sh /src/gpt2codex-alpha-container.sh build',vm)
+        self.assertNotIn('DEB_BUILD_OPTIONS=',vm)
 
     def test_push_api_completeness_errors_and_renames(self):
         event={'before':'a'*40,'after':'b'*40}

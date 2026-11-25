@@ -103,7 +103,7 @@ jobs:
     needs: verify-arm64
     if: needs.verify-arm64.outputs.ready == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
@@ -121,23 +121,44 @@ jobs:
           PY
       - name: Initialize explicit failure report
         run: |
-          mkdir -p out .tmp/cargo-armhf
-          printf '{"architecture":"armhf","status":"FAIL","reason":"Experimental ARM32 build did not complete; see build.log"}\n' > out/result-armhf.json
-      - name: Register pinned QEMU ARM32 emulator
+          mkdir -p out
+          printf '{"architecture":"armhf","status":"FAIL","reason":"Experimental ARM32 VM build did not complete; see vm-prepare.log and build.log"}\n' > out/result-armhf.json
+      - name: Register pinned QEMU ARM32 emulator for guest preparation only
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392  # v3.6.0
         with:
           image: ${{ steps.images.outputs.binfmt }}
           platforms: arm
-      - name: Build and test complete armhf package inside Debian 13
+      - name: Build and test complete armhf package under a Debian ARMv7 kernel
         env:
           IMAGE: ${{ steps.images.outputs.debian }}
+          SOURCE_SHA: ${{ needs.verify-arm64.outputs.sha }}
         run: |
-          set -o pipefail
-          docker run --rm --platform linux/arm/v7 -e G2C_ALPHA_CONTAINER=1 -e G2C_EXPECT_ARCH=armhf -v "$PWD:/src:ro" -v "$PWD/out:/out" -v "$PWD/.tmp/cargo-armhf:/cargo-cache" "$IMAGE" /bin/sh /src/gpt2codex-alpha-container.sh build 2>&1 | tee out/build.log
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          vm=$(mktemp -d "$RUNNER_TEMP/g2c-armhf-vm.XXXXXX")
+          cid=''
+          cleanup() {
+            if test -n "$cid"; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi
+            rm -rf -- "$vm"
+          }
+          trap cleanup EXIT
+          cid=$(docker create --platform linux/arm/v7 -e G2C_ARMHF_VM_MODE=prepare -v "$PWD:/src:ro" "$IMAGE" /bin/sh /src/packaging/armhf-vm.sh prepare)
+          docker start -a "$cid" 2>&1 | tee out/vm-prepare.log
+          test "$(docker inspect -f '{{.State.ExitCode}}' "$cid")" = 0
+          docker export "$cid" > "$vm/rootfs.tar"
+          docker rm "$cid" >/dev/null
+          cid=''
+          git archive --format=tar "$SOURCE_SHA" > "$vm/source.tar"
+          docker run --rm --platform linux/amd64 -e G2C_ARMHF_VM_MODE=run -v "$vm:/vm" -v "$PWD:/src:ro" -v "$PWD/out:/out" "$IMAGE" /bin/sh /src/packaging/armhf-vm.sh run 2>&1 | tee out/build.log
       - name: Verify final armhf package and report
         run: |
           python3 - <<'PY'
           import hashlib,json,pathlib,subprocess
+          assert pathlib.Path('out/vm-exit').read_text().strip()=='0','ARMHF VM did not complete successfully'
+          platform=dict(line.split('=',1) for line in pathlib.Path('out/vm-platform.txt').read_text().splitlines())
+          assert platform['execution']=='qemu-system-arm' and platform['architecture']=='armhf'
+          assert platform['machine']=='armv7l' and platform['bits']=='32' and platform['proc_generation']=='consistent'
+          assert platform['kernel'].endswith('-armmp-lpae'),'unexpected ARMHF guest kernel'
           report=json.loads(pathlib.Path('out/result-armhf.json').read_text())
           assert report['architecture']=='armhf' and report['status']=='PASS'
           assert report['backends']=={'konsole':'built-and-tested','qtermwidget':'built-and-tested'}
@@ -188,6 +209,11 @@ jobs:
           e=os.environ;tag=e['RELEASE_TAG'];sha=e['SOURCE_SHA']
           assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+',tag)
           assert subprocess.check_output(['git','rev-parse',f'refs/tags/{tag}^{{commit}}'],text=True).strip()==sha,'tag moved'
+          assert pathlib.Path('out/vm-exit').read_text().strip()=='0','ARMHF VM did not complete successfully'
+          platform=dict(line.split('=',1) for line in pathlib.Path('out/vm-platform.txt').read_text().splitlines())
+          assert platform['execution']=='qemu-system-arm' and platform['architecture']=='armhf'
+          assert platform['machine']=='armv7l' and platform['bits']=='32' and platform['proc_generation']=='consistent'
+          assert platform['kernel'].endswith('-armmp-lpae'),'unexpected ARMHF guest kernel'
           report=json.loads(pathlib.Path('out/result-armhf.json').read_text())
           assert report['architecture']=='armhf' and report['status']=='PASS'
           assert report['backends']=={'konsole':'built-and-tested','qtermwidget':'built-and-tested'}
@@ -197,7 +223,7 @@ jobs:
           assert deb.is_file() and hashlib.sha256(deb.read_bytes()).hexdigest()==report['sha256'],'digest mismatch'
           assert subprocess.check_output(['dpkg-deb','-f',str(deb),'Architecture'],text=True).strip()=='armhf'
           pathlib.Path('out/SHA256SUMS-armhf').write_text(report['sha256']+'  '+name+'\n')
-          pathlib.Path('out/ARMHF-REPORT.md').write_text('# Experimental armhf for '+tag+'\n\nValidated from workflow '+e['GITHUB_RUN_ID']+' and commit '+sha+'.\n\nSHA256: `'+report['sha256']+'`\n\nThis report supplements the original release manifest. No existing asset was replaced.\n')
+          pathlib.Path('out/ARMHF-REPORT.md').write_text('# Experimental armhf for '+tag+'\n\nValidated from workflow '+e['GITHUB_RUN_ID']+' and commit '+sha+'.\n\nExecution: QEMU full-system, ARMv7 Linux kernel `'+platform['kernel']+'`.\n\nSHA256: `'+report['sha256']+'`\n\nThis report supplements the original release manifest. No existing asset was replaced.\n')
           PY
       - name: Ensure release exists and no published assets are replaced
         env:
