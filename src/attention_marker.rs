@@ -696,6 +696,27 @@ mod tests {
     use std::sync::Mutex;
     static ENV: Mutex<()> = Mutex::new(());
 
+    // Invoked only by the owned Qt fixture on a generation mismatch. This
+    // diagnostic is compiled into the test harness, never the installed CLI.
+    #[test]
+    #[ignore = "requires a live synthetic Qt fixture"]
+    fn synthetic_gui_generation_probe() {
+        let path = PathBuf::from(
+            std::env::var_os("G2C_MARKER_PROBE_RECORD").expect("synthetic record required"),
+        );
+        let record = screen::read_record(&path)
+            .expect("synthetic record must be readable")
+            .expect("synthetic record missing");
+        assert!(record.task == "Fixture", "only synthetic fixture records are supported");
+        let pid = record.pid.expect("synthetic server PID required");
+        assert_eq!(pid, unsafe { libc::getppid() } as u32, "probe parent must be the fixture server");
+        let saved = record.process_start_ticks.expect("synthetic generation required");
+        let actual = process(pid)
+            .map(|(_, ticks)| ticks.to_string())
+            .unwrap_or_else(|| "unavailable".into());
+        println!("\nMARKER_GENERATION_RUST record_ticks={saved} proc_ticks={actual}");
+    }
+
     struct Fixture {
         root: PathBuf,
         old: Option<std::ffi::OsString>,

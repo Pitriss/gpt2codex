@@ -1,6 +1,8 @@
 // Owned synthetic processes/registries only, used by Qt marker regressions.
 #pragma once
+#include <QDebug>
 #include <QJsonArray>
+#include <QRegularExpression>
 #include <QSaveFile>
 #include <QProcessEnvironment>
 #include <sys/socket.h>
@@ -63,6 +65,60 @@ public:
         return result;
     }
 
+    // Diagnostic only: compare immutable start ticks of the owned synthetic server.
+    // The Rust probe is an uninstalled test harness, not a new CLI operation.
+    void diagnoseGeneration(const QString &recordPath, quint32 server, quint64 ticks,
+                            QProcessEnvironment env) {
+        static bool reported = false;
+        if (reported) { return; }
+        reported = true;
+        const auto serialized = bytes(recordPath);
+        const QRegularExpression jsonNumber(QStringLiteral("\"process_start_ticks\"\\s*:\\s*([-+0-9.eE]{1,32})\\s*[,}]"));
+        const auto match = jsonNumber.match(QString::fromUtf8(serialized));
+        const auto jsonToken = match.hasMatch() ? match.captured(1) : QStringLiteral("unavailable");
+        const auto qtReadback = QJsonDocument::fromJson(serialized).object()
+            .value("process_start_ticks").toInteger(-1);
+        QString procToken = QStringLiteral("unavailable");
+        QFile statFile(QStringLiteral("/proc/") + QString::number(server) + QStringLiteral("/stat"));
+        if (statFile.open(QIODevice::ReadOnly)) {
+            const auto raw = statFile.read(4097);
+            const auto end = raw.lastIndexOf(')');
+            if (end >= 0 && raw.size() <= 4096) {
+                const auto fields = raw.mid(end + 1).simplified().split(' ');
+                const auto token = QString::fromLatin1(fields.value(19));
+                if (QRegularExpression(QStringLiteral("^[0-9]{1,20}$")).match(token).hasMatch()) {
+                    procToken = token;
+                }
+            }
+        }
+        qWarning().noquote() << QStringLiteral("MARKER_GENERATION_QT proc_raw_ticks=%1 parsed_ticks=%2 json_raw_ticks=%3 json_qt_ticks=%4")
+            .arg(procToken, QString::number(ticks), jsonToken, QString::number(qtReadback));
+        const QString executable = qEnvironmentVariable("G2C_MARKER_RUST_PROBE");
+        if (executable.isEmpty() || !QFileInfo(executable).isExecutable()) {
+            qWarning("MARKER_GENERATION_RUST status=probe_unavailable");
+            return;
+        }
+        env.insert("G2C_MARKER_PROBE_RECORD", recordPath);
+        QProcess probe;
+        probe.setProcessEnvironment(env);
+        probe.start(executable, {"--exact", "attention_marker::tests::synthetic_gui_generation_probe",
+            "--ignored", "--nocapture", "--test-threads=1"});
+        if (!probe.waitForStarted(3000) || !probe.waitForFinished(10000)) {
+            if (probe.state() != QProcess::NotRunning) { probe.kill(); probe.waitForFinished(1000); }
+            qWarning("MARKER_GENERATION_RUST status=probe_start_or_timeout");
+            return;
+        }
+        const QRegularExpression resultPattern(QStringLiteral("^MARKER_GENERATION_RUST record_ticks=[0-9]{1,20} proc_ticks=([0-9]{1,20}|unavailable)$"));
+        bool found = false;
+        for (const auto &line : probe.readAllStandardOutput().split('\n')) {
+            const auto message = QString::fromLatin1(line);
+            if (resultPattern.match(message).hasMatch()) { qWarning().noquote() << message; found = true; }
+        }
+        if (!found || probe.exitStatus() != QProcess::NormalExit || probe.exitCode() != 0) {
+            qWarning("MARKER_GENERATION_RUST status=probe_failed");
+        }
+    }
+
     std::shared_ptr<Actor> start(const QString &project, const QString &mux) {
         const QString root = base + "/repos/" + project;
         // Attention tests need a valid registered project, not an empty fake Git checkout.
@@ -91,7 +147,8 @@ public:
                 {"socket_dev", qint64(st.st_dev)}, {"socket_ino", qint64(st.st_ino)}});
         }
         const QString suffix = mux == "tmux" ? ".tmux.json" : ".json";
-        if (!json(state + "/gpt2codex/screen-sessions/" + project + suffix, record)) { return {}; }
+        const QString recordPath = state + "/gpt2codex/screen-sessions/" + project + suffix;
+        if (!json(recordPath, record)) { return {}; }
         actor->process = std::make_unique<QProcess>();
         auto env = QProcessEnvironment::systemEnvironment();
         env.insert("HOME", base + "/h"); env.insert("XDG_RUNTIME_DIR", runtime); env.insert("XDG_STATE_HOME", state);
@@ -100,7 +157,13 @@ public:
         actor->process->start(cli, {"attention", "run", "--id", project, "--multiplexer", mux, "--config", config, "--approve-run"});
         if (!actor->process->waitForStarted(3000)) { return {}; }
         const auto ready = reply(*actor->process);
-        actor->nonce = ready.value("ready").toString(); if (!g2cattention::marker::nonce(actor->nonce)) { return {}; }
+        actor->nonce = ready.value("ready").toString();
+        if (!g2cattention::marker::nonce(actor->nonce)) {
+            if (error.contains("reason=server_generation_mismatch")) {
+                diagnoseGeneration(recordPath, server, provenance->ticks, env);
+            }
+            return {};
+        }
         actor->directory = runtime + "/gpt2codex/attention/" + actor->nonce;
         actor->binding = QJsonDocument::fromJson(bytes(actor->directory + "/binding.json")).object();
         actors.append(actor);

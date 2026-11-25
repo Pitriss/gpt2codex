@@ -22,7 +22,13 @@ override_dh_auto_build:
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	cargo test --frozen --all-targets
+ifeq ($(DEB_HOST_ARCH),armhf)
+	# Reuse the exact Rust library test executable for synthetic Qt diagnostics.
+	cargo test --frozen --lib --no-run --message-format=json > .alpha-build/marker-probe.json
+	probe=$$(python3 -c 'import json,sys; items=map(json.loads,sys.stdin); paths=[i["executable"] for i in items if i.get("reason")=="compiler-artifact" and i.get("executable") and i.get("profile",{}).get("test") and "lib" in i.get("target",{}).get("kind",[])]; assert len(paths)==1; print(paths[0])' < .alpha-build/marker-probe.json) && test -x "$$probe" && G2C_MARKER_RUST_PROBE="$$probe" ctest --test-dir .alpha-build/gui --output-on-failure
+else
 	ctest --test-dir .alpha-build/gui --output-on-failure
+endif
 	python3 ./gpt2codex-alpha.py self-test --cli .alpha-build/bin/gpt2codex --gui .alpha-build/bin/gpt2codex-gui
 endif
 
