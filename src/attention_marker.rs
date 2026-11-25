@@ -620,10 +620,11 @@ pub fn run(config: &Path, target: Target<'_>, mux: Multiplexer) -> Result<()> {
             .ok_or_else(|| err("PID namespace unavailable"))?
             .to_string(),
     };
-    if !binding.live() {
-        return Err(err(
-            "launcher is not inside the registered persistent session",
-        ));
+    if let Err(reason) = binding.check_live() {
+        return Err(err(format!(
+            "launcher is not inside the registered persistent session; reason={}",
+            reason.code()
+        )));
     }
     let (runtime_path, attention) = runtime(true)?;
     let creation_lock = attention.lock()?;

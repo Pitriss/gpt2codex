@@ -303,7 +303,14 @@ jobs:
   publish:
     name: Gated stable release
     needs: [quick, release-inputs]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLISH_ENABLED == 'true'
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.quick.result == 'success' &&
+      needs.release-inputs.result == 'success' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      vars.RELEASE_PUBLISH_ENABLED == 'true'
     environment: stable-release
     permissions:
       contents: write
