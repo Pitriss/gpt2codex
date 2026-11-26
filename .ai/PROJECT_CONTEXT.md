@@ -1,5 +1,15 @@
 # Project context
 
+The 0.1.3 release preparation (2026-11-26) retains Debian 13 amd64 as the
+mandatory release platform and arm64/armhf as experimental targets. The
+ARMHF follow-up now builds and tests under a Debian ARMv7 kernel instead
+of using QEMU linux-user for execution; exact process identity checks are
+unchanged. The temporary generation probe is removed after the successful
+VM tests in run 45617259657. Final host validation was corrected in
+`deb04f1`; the 0.1.3 tag and full release evidence are still pending.
+See [platforms and CI](PLATFORMS_CI.md). Older alpha descriptions below
+are historical; no automatic Git writes or publication are authorized.
+
 The approved P0-A/P0-M attention work adds a shared tab model and a real
 waiting-only marker source (2026-11-02). New explicitly instrumented Codex runs
 may mark/clear ordinary questions in private XDG_RUNTIME_DIR metadata; existing

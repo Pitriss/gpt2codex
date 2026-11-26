@@ -2,13 +2,16 @@
 
 ## Current stable release target
 
-Package version `0.1.0`, tag `v0.1.0`; workflow `.github/workflows/release.yml`.
+Package version target `0.1.3`, tag `v0.1.3`; workflow `.github/workflows/release.yml`.
 Publication remains operator-controlled: `RELEASE_PUBLISH_ENABLED=true` and
 GitHub environment `stable-release` are required for the publish job.
 Tag pushes run mandatory Rust/Qt tests, build and Debian 13 install/remove
 verification before automatic publication. A normal branch push does not
 run the release workflow. Manual dispatch is diagnostic, never publishing.
 Existing Debian amd64 acceptance gates and experimental ARM builds remain.
+The independent ARMHF follow-up requires validated arm64 evidence from the
+same source commit. It may add only new assets to an existing approved tag
+release; no replacement of published assets or manual-dispatch publication.
 
 ## ARMHF experimental execution (2026-11-25)
 
@@ -20,9 +23,18 @@ ARMHF guest, then runs the unchanged complete package build and all tests
 under its ARMv7 LPAE kernel in QEMU full-system mode. Both the guest kernel
 and system emulator are installed from the signed CI snapshot. A successful
 guest exit, consistent proc generation, and normal package validation are
-required for acceptance/publication. The first hosted full-system run is
-still required to verify boot, timing and test compatibility. ARMHF remains
-experimental and non-blocking, and manual dispatch cannot publish.
+required for acceptance/publication. Hosted run 45617259657 (`349d02d`)
+booted Debian `6.12.113+deb13-armmp-lpae`, verified consistent process
+identity, passed 92 library and 13 CLI Rust tests (one temporary diagnostic
+ignored), all three CTest targets including the previously failing marker
+regressions, Python tests and guest package inspection, and exited zero.
+Final host inspection failed only because the clean checkout lacked `.tmp`;
+commit `deb04f1` provides disposable runner-local inspection scratch.
+The temporary cross-process probe is no longer needed and is removed for
+0.1.3; strict generation checks, categorical errors and functional tests
+remain. The full v0.1.3 tag build and release are still to be verified.
+ARMHF remains experimental and non-blocking, and manual dispatch cannot
+publish. This evidence is from a VM, not a physical ARMHF device.
 
 ## Historical first-alpha preparation (2026-10-28)
 

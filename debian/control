@@ -12,7 +12,7 @@ Architecture: amd64 arm64 armhf
 Depends: ${shlibs:Depends}, ${misc:Depends}, python3, git, screen
 Recommends: konsole-kpart (>= 4:25.04), qt6-svg-plugins, breeze-icon-theme
 Suggests: tmux
-Description: local Codex bridge and Qt6 persistent terminal views (alpha)
+Description: local Codex bridge and Qt6 persistent terminal views
  Local Rust CLI and Qt6 GUI for explicitly registered projects, with
  Konsole KPart and QTermWidget terminal modules. GNU screen is the default
  multiplexer; tmux is optional. Codex must be supplied separately.

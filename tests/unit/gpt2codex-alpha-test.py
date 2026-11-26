@@ -233,6 +233,9 @@ class AlphaTests(unittest.TestCase):
         scratch=self.base/'work/tmp';scratch.mkdir(parents=True)
         package=self.base/'package'
         (package/'DEBIAN').mkdir(parents=True)
+        # dpkg-deb requires control directory mode 0755..0775, regardless of
+        # the caller's umask. Only the private synthetic package is affected.
+        (package/'DEBIAN').chmod(0o755)
         arch=subprocess.check_output(['dpkg','--print-architecture'],text=True).strip()
         (package/'DEBIAN/control').write_text(
             f'Package: gpt2codex\nVersion: {alpha.VERSION}\nArchitecture: {arch}\n'
@@ -249,7 +252,8 @@ class AlphaTests(unittest.TestCase):
                           'usr/share/doc/gpt2codex/cargo-licenses/versions.json':'[]'}.items():
             target=package/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_text(data)
         deb=self.base/'fixture.deb'
-        subprocess.run(['dpkg-deb','--build','--root-owner-group',str(package),str(deb)],check=True,capture_output=True)
+        built=subprocess.run(['dpkg-deb','--build','--root-owner-group',str(package),str(deb)],capture_output=True,text=True)
+        self.assertEqual(built.returncode,0,built.stdout+built.stderr)
         with patch.object(alpha,'ROOT',source),patch.dict(os.environ,{'TMPDIR':str(scratch)}),patch.object(alpha,'run',wraps=alpha.run) as extract:
             alpha.inspect_deb(deb,arch)
         unpacked=Path(extract.call_args.args[0][-1])

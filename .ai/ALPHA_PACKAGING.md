@@ -1,6 +1,6 @@
 # First alpha packaging and CI (approved preparation only)
 
-> Historical alpha preparation document. For the current stable 0.1.0 release
+> Historical alpha preparation document. For current stable releases
 > use `.github/workflows/release.yml` and `.ai/PLATFORMS_CI.md`.
 > Do not interpret the old alpha tag or publish instructions below as current.
 

@@ -5,12 +5,15 @@ persistent Codex terminals. GNU screen is the default multiplexer; tmux is an
 optional per-project preference. Konsole KPart and QTermWidget are independent
 terminal backends. Codex is supplied separately by the operator.
 
-The target first stable Debian package is **0.1.0** (tag `v0.1.0`).
+The Debian package release target is **0.1.3** (tag `v0.1.3`).
 A pushed stable tag starts isolated Debian package builds and release tests.
 Publication happens only after mandatory checks and the configured
-GitHub environment and RELEASE_PUBLISH_ENABLED gate. ARM builds and clean
-Debian/Devuan install compatibility must be evaluated from actual CI results;
-source availability alone does not establish support.
+GitHub environment and RELEASE_PUBLISH_ENABLED gate. Debian 13 amd64 is
+release-blocking. Arm64 and armhf remain experimental. The armhf follow-up
+runs all package tests under a full-system ARMv7 kernel and may supplement an
+existing approved release only after its own validation. Consult the actual
+release assets and CI results; preparing a version does not publish it or
+establish native ARM hardware or Devuan compatibility.
 
 ## Safety and current limits
 

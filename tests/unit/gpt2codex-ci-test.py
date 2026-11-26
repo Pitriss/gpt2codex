@@ -148,12 +148,16 @@ class CITests(unittest.TestCase):
         out=work/'out';(out/'validated').mkdir(parents=True)
         # Inert armhf package: dpkg-deb reads metadata, never runs the payload.
         tree=self.base/'package';(tree/'DEBIAN').mkdir(parents=True)
+        # dpkg-deb requires control directory mode 0755..0775 even under
+        # a restrictive umask. Only this disposable fixture is affected.
+        (tree/'DEBIAN').chmod(0o755)
         version=packaging.alpha.VERSION
         (tree/'DEBIAN/control').write_text(
             f'Package: gpt2codex\nVersion: {version}\nArchitecture: armhf\n'
             'Maintainer: Synthetic fixture\nDescription: inert CI fixture\n')
         deb=out/'validated'/f'gpt2codex_{version}_armhf.deb'
-        subprocess.run(['dpkg-deb','--build',str(tree),str(deb)],check=True,capture_output=True)
+        built=subprocess.run(['dpkg-deb','--build','--root-owner-group',str(tree),str(deb)],capture_output=True,text=True)
+        self.assertEqual(built.returncode,0,built.stdout+built.stderr)
         (out/'vm-exit').write_text('0\n')
         (out/'vm-platform.txt').write_text('execution=qemu-system-arm\narchitecture=armhf\n'
             'machine=armv7l\nbits=32\nkernel=fixture-armmp-lpae\nproc_generation=consistent\n')

@@ -1,3 +1,15 @@
+gpt2codex (0.1.3) unstable; urgency=medium
+
+  * Run experimental armhf builds and tests under a full-system ARMv7 kernel
+    to preserve exact process generation checks.
+  * Use distinct pinned Debian platform images and isolated host inspection.
+  * Fix the stable release gate after successful mandatory validation.
+  * Retain categorical attention identity errors and remove the temporary
+    cross-process diagnostic probe without removing functional tests.
+  * Refresh stable package metadata; arm64 and armhf remain experimental.
+
+ -- Pitriss <5106460+Pitriss@users.noreply.github.com>  Thu, 26 Nov 2026 08:33:00 +0100
+
 gpt2codex (0.1.2) unstable; urgency=medium
 
   * Build Debian arm64 packages on native GitHub Actions runners.
